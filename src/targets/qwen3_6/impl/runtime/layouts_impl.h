@@ -596,9 +596,16 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
+#if defined(NINFER_GFX906_COMPAT)
+    // HIP reports gfx906 (Vega20 / GCN 9.0) as major 9, minor 0.
+    if (device.sm() != 90) {
+        throw std::invalid_argument("Qwen3.6 family gfx906 runtime requires a gfx9 GPU");
+    }
+#else
     if (device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
     }
+#endif
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,

@@ -4,6 +4,11 @@
 
 namespace ninfer::ops {
 
+// gfx906 (wave64) note: kWarpSize stays 32 as the *logical* subgroup width.
+// core/hip_compat.h maps __shfl_*_sync(mask, ...) to HIP's unmasked shuffles;
+// a width-32 shuffle subdivides a 64-lane wave into two independent 32-lane
+// groups, so every helper below keeps its CUDA semantics. kFullWarpMask is
+// accepted and ignored by the compat shims.
 inline constexpr int kWarpSize          = 32;
 inline constexpr unsigned kFullWarpMask = 0xffffffffu;
 

@@ -4,6 +4,72 @@
 
 namespace ninfer::ops {
 
+#if defined(NINFER_GFX906_COMPAT)
+
+// gfx906 has no tensor cores and no ldmatrix. Every kernel that reaches these
+// helpers is REWRITE scope (dequant -> packed-FP16 FMA); until each family is
+// rewritten, the stubs below keep the mechanical translation units compiling
+// and abort the wave if executed. Dispatch must never route here on gfx906.
+__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned) {
+    r0 = r1 = 0u;
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
+                                            unsigned) {
+    r0 = r1 = r2 = r3 = 0u;
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, unsigned) {
+    r0 = r1 = 0u;
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsigned& r2,
+                                              unsigned& r3, unsigned) {
+    r0 = r1 = r2 = r3 = 0u;
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void mma_bf16(float&, float&, float&, float&, unsigned, unsigned,
+                                         unsigned, unsigned, unsigned, unsigned) {
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void mma_f16(float&, float&, float&, float&, unsigned, unsigned,
+                                        unsigned, unsigned, unsigned, unsigned) {
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void mma_s8(int&, int&, int&, int&, unsigned, unsigned, unsigned,
+                                       unsigned, unsigned, unsigned) {
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void mma_fp8_e4m3(float&, float&, float&, float&, unsigned, unsigned,
+                                             unsigned, unsigned, unsigned, unsigned) {
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void mma_tf32_bits(float&, float&, float&, float&, unsigned, unsigned,
+                                              unsigned, unsigned, unsigned, unsigned) {
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void mma_tf32(float&, float&, float&, float&, float, float, float, float,
+                                         float, float) {
+    __builtin_trap();
+}
+
+__device__ __forceinline__ void mma_nvfp4_e4m3(float&, float&, float&, float&, unsigned, unsigned,
+                                               unsigned, unsigned, unsigned, unsigned, unsigned,
+                                               unsigned) {
+    __builtin_trap();
+}
+
+#else // !NINFER_GFX906_COMPAT
+
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)
@@ -101,5 +167,7 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
                    "h"(kScaleThreadId));
 }
+
+#endif // NINFER_GFX906_COMPAT
 
 } // namespace ninfer::ops
