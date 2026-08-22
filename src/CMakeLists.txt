@@ -1,4 +1,8 @@
 function(ninfer_internal_includes target)
+  # The gfx906 compat include tree must come first so that #include
+  # <cuda_runtime.h> and friends resolve to the HIP-mapping shims.
+  target_include_directories(${target} BEFORE PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/compat/gfx906/include)
   target_include_directories(${target} PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
@@ -6,11 +10,18 @@ function(ninfer_internal_includes target)
     ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
 endfunction()
 
+# Compiles a target's .cu sources as HIP (the llama.cpp-gfx906 pattern: CUDA
+# sources build directly under hip-clang). Call after the target's source list
+# is final. gfx906 has no separable-compilation requirement; the archives are
+# plain static libraries.
 function(ninfer_cuda_archive target)
-  set_target_properties(${target} PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  get_target_property(_ninfer_hip_sources ${target} SOURCES)
+  list(FILTER _ninfer_hip_sources INCLUDE REGEX "\\.cu$")
+  if(_ninfer_hip_sources)
+    set_source_files_properties(${_ninfer_hip_sources} PROPERTIES LANGUAGE HIP)
+  endif()
+  target_compile_options(${target} PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:--gpu-max-threads-per-block=1024>)
 endfunction()
 
 # Device/tensor/layout/graph primitives and the model-independent request runtime.
@@ -32,7 +43,7 @@ add_library(ninfer_core STATIC
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PUBLIC hip::host Threads::Threads)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -44,19 +55,9 @@ add_library(ninfer_artifact STATIC
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 
-# The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
-# producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
-# discard that contract, so this self-contained kernel is intentionally compiled in a
-# non-RDC archive and called through a host launcher from ninfer_ops.
-add_library(ninfer_nvfp4_tma STATIC
-  ops/linear/nvfp4/nvfp4_w4a4_tma.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
-ninfer_internal_includes(ninfer_nvfp4_tma)
-set_target_properties(ninfer_nvfp4_tma PROPERTIES
-  CUDA_SEPARABLE_COMPILATION OFF
-  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+# The NVFP4 TMA archive (warp-specialized SM120 kernels) is deleted on gfx906:
+# the hardware has no TMA, no NVFP4, and no tensor cores. Its launchers are
+# stubbed in ops/gfx906_stubs.cpp.
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
@@ -260,9 +261,19 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
+
+# gfx906 has no FP8/NVFP4 units and the 27B target is dense, so the fp8/,
+# nvfp4/, and sparse_moe/ op families are deleted from the build (pattern:
+# ninfer-3090's w4a4 source filtering). Their entry points become throwing
+# stubs so the retained dispatch layers still link.
+get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
+list(FILTER ninfer_ops_sources EXCLUDE REGEX "(fp8|nvfp4|sparse_moe)/")
+set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})
+target_sources(ninfer_ops PRIVATE ops/gfx906_stubs.cpp)
+
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
@@ -270,10 +281,17 @@ add_library(ninfer_text STATIC
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
 
-add_library(ninfer_media_decode STATIC
-  media/decode/decode.cpp)
-ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+if(NINFER_ENABLE_MEDIA)
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+  target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+else()
+  # FFmpeg-free build: media decode entry points throw at runtime.
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode_stub.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+endif()
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
@@ -339,5 +357,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire CUDA::cudart)
+    PRIVATE ninfer_media_acquire hip::host)
 endif()
