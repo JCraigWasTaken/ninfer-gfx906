@@ -60,6 +60,18 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   set(NINFER_BUILD_SERVE ON)
 endif()
 
+# llama.cpp-gfx906 pattern: locate the ROCm install for hip-config.cmake.
+if(NOT EXISTS $ENV{ROCM_PATH})
+  if(EXISTS /opt/rocm)
+    set(ROCM_PATH /opt/rocm)
+  else()
+    set(ROCM_PATH /usr)
+  endif()
+else()
+  set(ROCM_PATH $ENV{ROCM_PATH})
+endif()
+list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH} ${ROCM_PATH}/lib64/cmake)
+
 find_package(hip REQUIRED CONFIG)
 if(NINFER_ENABLE_MEDIA)
   find_package(PkgConfig REQUIRED)
