@@ -1,3 +1,18 @@
+# NInfer-gfx906 — AMD Instinct MI50/MI60 port (work in progress)
+
+> **This fork is porting NInfer to AMD gfx906 (Instinct MI50/MI60, HIP/ROCm)** —
+> the first AMD target in the NInfer ecosystem. Target model: Qwen3.8-27B
+> (groupwise-int artifact, which contains no FP8/NVFP4 and runs on a 32GB MI50
+> as-is). Status: **engineering audit complete, port in progress** — see
+> [`docs/gfx906/PORT-AUDIT.md`](docs/gfx906/PORT-AUDIT.md) for the full kernel
+> census, port order, and donor-kernel map. Contributions welcome — the
+> [audit](docs/gfx906/PORT-AUDIT.md) lists the rewrite surface (~24 kernels)
+> and the hardest five items. Credits: upstream
+> [Neroued/ninfer](https://github.com/Neroued/ninfer), the
+> [ninfer-3090](https://github.com/Don-Chad/ninfer-3090) down-port playbook,
+> and the [llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906)
+> kernel authors. Upstream README follows.
+
 # NInfer
 
 > Selected checkpoints. Maximum single-GPU inference performance.
