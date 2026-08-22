@@ -31,6 +31,8 @@
 #define cudaGraph_t hipGraph_t
 #define cudaGraphExec_t hipGraphExec_t
 
+#define CUDART_VERSION HIP_VERSION
+
 // --- runtime API: enums / constants -----------------------------------------
 #define cudaSuccess hipSuccess
 #define cudaErrorInvalidValue hipErrorInvalidValue
@@ -107,6 +109,13 @@ inline hipError_t ninfer_hip_func_set_attribute(F* func, hipFuncAttribute attrib
     return hipFuncSetAttribute(reinterpret_cast<const void*>(func), attribute, value);
 }
 #define cudaFuncSetAttribute ninfer_hip_func_set_attribute
+
+// --- device-code attributes without a HIP equivalent -------------------------
+// __grid_constant__ params are plain by-value params on HIP; __maxnreg__ is an
+// NVIDIA register-budget hint (gfx906 occupancy is retuned in the rewrite
+// stages instead).
+#define __grid_constant__
+#define __maxnreg__(n)
 
 // --- warp shuffles -----------------------------------------------------------
 // ninfer's kernels operate on logical 32-lane subgroups. HIP's unmasked
