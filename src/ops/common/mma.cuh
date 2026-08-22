@@ -2,6 +2,20 @@
 
 #include "ops/common/memory.cuh"
 
+// Marks a tensor-core kernel body that is not yet rewritten for gfx906. The
+// early trap lets the AMD backend dead-code-eliminate the register tiles that
+// only fit thanks to ldmatrix/mma on NVIDIA (they exceed the 64KiB scratch
+// limit if materialized); dispatch must never route to such a kernel.
+#if defined(NINFER_GFX906_COMPAT)
+#define NINFER_GFX906_UNPORTED_KERNEL() \
+    {                                   \
+        __builtin_trap();               \
+        return;                         \
+    }
+#else
+#define NINFER_GFX906_UNPORTED_KERNEL()
+#endif
+
 namespace ninfer::ops {
 
 #if defined(NINFER_GFX906_COMPAT)

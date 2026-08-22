@@ -19,6 +19,7 @@ __global__
 __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_splitk_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, int active_cols) {
+    NINFER_GFX906_UNPORTED_KERNEL();
     constexpr int kTileK       = 64;
     constexpr int kMmaRows     = 16;
     constexpr int kRowsPerCta  = 16;

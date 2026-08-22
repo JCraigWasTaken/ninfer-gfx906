@@ -42,6 +42,10 @@ __device__ __forceinline__ Bf16GemvPack<Values> load_bf16_pack(const __nv_bfloat
 template <Bf16WeightCache Cache, int Values>
 __device__ __forceinline__ Bf16GemvPack<Values>
 load_bf16_weight_pack(const __nv_bfloat16* pointer) {
+#if defined(NINFER_GFX906_COMPAT)
+    // No ld.global.cg streaming hint on gfx906; plain vector loads.
+    return load_bf16_pack<Values>(pointer);
+#else
     if constexpr (Cache == Bf16WeightCache::Default) {
         return load_bf16_pack<Values>(pointer);
     } else if constexpr (Values == 4) {
@@ -67,6 +71,7 @@ load_bf16_weight_pack(const __nv_bfloat16* pointer) {
         }
         return result;
     }
+#endif // NINFER_GFX906_COMPAT
 }
 
 template <int Values, int AccumulatorChains>

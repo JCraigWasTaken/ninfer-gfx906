@@ -60,6 +60,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
     RowPolicy row_policy = {}) {
+    NINFER_GFX906_UNPORTED_KERNEL();
     constexpr int kHidden     = Geometry::kInputRows;
     constexpr int kTileK      = Schedule::kTileKPerWarp;
     constexpr int kWarps      = Schedule::kKWarps;
