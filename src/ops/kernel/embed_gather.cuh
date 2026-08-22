@@ -7,7 +7,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#if !defined(NINFER_GFX906_COMPAT)
 #include <cuda_fp8.h>
+#endif
 
 #include <cstdint>
 
@@ -22,6 +24,7 @@ inline constexpr std::int32_t kEmbedGatherW8D              = 2048;
 inline constexpr std::int32_t kEmbedGatherW8Groups         = kEmbedGatherW8D / kEmbedGatherW8Group;
 inline constexpr std::int32_t kEmbedGatherFp8D             = 5120;
 
+#if !defined(NINFER_GFX906_COMPAT)
 template <int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
     void embed_gather_fp8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
@@ -58,6 +61,7 @@ __launch_bounds__(Threads) __global__
         }
     }
 }
+#endif // !NINFER_GFX906_COMPAT
 
 __device__ __forceinline__ int unpack_q6_code(const std::uint8_t* nibble, const std::uint8_t* high,
                                               int index) {
