@@ -13,7 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #    include "ops/common/math.cuh"
 #    include "ops/common/memory.cuh"
 #    include "ops/common/warp.cuh"
@@ -43,7 +43,7 @@ inline uint3 init_fastdiv_values(std::uint64_t d64) {
     return make_uint3(mp, L, d);
 }
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 
 static __device__ __forceinline__ std::uint32_t fastdiv(std::uint32_t n, uint3 fastdiv_values) {
     const std::uint32_t hi = __umulhi(n, fastdiv_values.x);
@@ -95,7 +95,7 @@ issue_load_bf16_to_float_vec4(View view, const __nv_bfloat16* __restrict__ gmem_
 
 inline constexpr float kLog2E = 1.4426950408889634f;
 
-#endif // __CUDACC__
+#endif // __CUDACC__ || __HIPCC__
 
 struct head_map {
     int H_qk;
@@ -110,7 +110,7 @@ struct head_map {
     NINFER_KERNELS_HOST_DEVICE int group_size() const { return H_v / H_qk; }
 
     NINFER_KERNELS_HOST_DEVICE int qk_head(int h_v) const {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
         return static_cast<int>(fastdiv(static_cast<std::uint32_t>(h_v), group_magic));
 #else
         return h_v / group_size();
