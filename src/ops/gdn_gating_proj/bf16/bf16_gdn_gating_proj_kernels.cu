@@ -277,6 +277,34 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
         CUDA_CHECK(attr);
         if constexpr (SplitK > 1) {
+#if defined(NINFER_GFX906_COMPAT)
+            // HIP has no cudaLaunchKernelEx; grid-synchronizing kernels go
+            // through hipLaunchCooperativeKernel's void** parameter form.
+            const __nv_bfloat16* x_arg = static_cast<const __nv_bfloat16*>(x.data);
+            const __nv_bfloat16* norm_weight_arg =
+                norm_weight != nullptr ? static_cast<const __nv_bfloat16*>(norm_weight->data)
+                                       : nullptr;
+            __nv_bfloat16* normalized_x_arg =
+                normalized_x != nullptr ? static_cast<__nv_bfloat16*>(normalized_x->data) : nullptr;
+            float norm_eps_arg              = norm_eps;
+            const __nv_bfloat16* a_arg      = static_cast<const __nv_bfloat16*>(a_weight.qdata);
+            const __nv_bfloat16* b_arg      = static_cast<const __nv_bfloat16*>(b_weight.qdata);
+            const float* a_log_arg          = static_cast<const float*>(A_log.data);
+            const float* dt_bias_arg        = static_cast<const float*>(dt_bias.data);
+            float* partial_arg              = static_cast<float*>(workspace);
+            float* g_arg                    = static_cast<float*>(g.data);
+            float* beta_arg                 = static_cast<float*>(beta.data);
+            std::int32_t t_arg              = t;
+            void* args[]                    = {&x_arg,      &norm_weight_arg, &normalized_x_arg,
+                                               &norm_eps_arg, &a_arg,         &b_arg,
+                                               &a_log_arg,  &dt_bias_arg,     &partial_arg,
+                                               &g_arg,      &beta_arg,        &t_arg};
+            CUDA_CHECK(hipLaunchCooperativeKernel(
+                reinterpret_cast<const void*>(
+                    bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
+                                                         NormalizeInput, NormTokenCapacity>),
+                grid, block, args, kSmemBytes, stream));
+#else
             cudaLaunchConfig_t config{};
             config.gridDim          = grid;
             config.blockDim         = block;
@@ -301,6 +329,7 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                 static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
                 static_cast<float*>(workspace), static_cast<float*>(g.data),
                 static_cast<float*>(beta.data), t));
+#endif
         } else {
             bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
                                                  NormalizeInput, NormTokenCapacity>
