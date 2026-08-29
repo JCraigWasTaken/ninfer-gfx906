@@ -186,8 +186,16 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
                                             std::int32_t value_heads, std::int32_t tokens,
                                             bool normalize_qk) {
     ChunkedWorkspace out;
+#if defined(NINFER_GFX906_COMPAT)
+    // gfx906: the chunked WY-representation kernels are unported mma stubs, so
+    // no full chunk is ever launched and no chunked workspace is needed (keeps
+    // the capacity accounting consistent with the execution path below).
+    constexpr std::int32_t full = 0;
+    (void)tokens;
+#else
     const std::int32_t full =
         (tokens / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
+#endif
     if (full == 0) { return out; }
     if (normalize_qk) {
         out.normalized_q =
@@ -251,8 +259,17 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
     auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];
+#if defined(NINFER_GFX906_COMPAT)
+    // gfx906: the chunked WY-representation kernels (chunked/launch.cu) are
+    // unported mma stubs that trap if launched. Force every token count —
+    // decode AND prefill — through the SIMT recurrent tail path below: slow
+    // prefill, correct output (PORT-AUDIT stage 3; the chunked rewrite is
+    // stage-9 scope).
+    constexpr std::int32_t T_full = 0;
+#else
     const std::int32_t T_full =
         (T / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
+#endif
     ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
     Tensor q_compute         = q;
     Tensor k_compute         = k;
