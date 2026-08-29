@@ -294,11 +294,18 @@ else()
 endif()
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
-  # Product-only path/data/HTTP acquisition. No target package links this library.
-  add_library(ninfer_media_acquire STATIC
-    product/media_acquire/acquire.cpp)
-  ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  if(NINFER_ENABLE_MEDIA)
+    # Product-only path/data/HTTP acquisition. No target package links this library.
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire.cpp)
+    ninfer_internal_includes(ninfer_media_acquire)
+    target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  else()
+    # libcurl-free build: media acquisition entry points throw at runtime.
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire_stub.cpp)
+    ninfer_internal_includes(ninfer_media_acquire)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)
