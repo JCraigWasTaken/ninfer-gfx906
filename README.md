@@ -1,17 +1,48 @@
 # NInfer-gfx906 — AMD Instinct MI50/MI60 port (work in progress)
 
-> **This fork is porting NInfer to AMD gfx906 (Instinct MI50/MI60, HIP/ROCm)** —
-> the first AMD target in the NInfer ecosystem. Target model: Qwen3.8-27B
-> (groupwise-int artifact, which contains no FP8/NVFP4 and runs on a 32GB MI50
-> as-is). Status: **engineering audit complete, port in progress** — see
-> [`docs/gfx906/PORT-AUDIT.md`](docs/gfx906/PORT-AUDIT.md) for the full kernel
-> census, port order, and donor-kernel map. Contributions welcome — the
-> [audit](docs/gfx906/PORT-AUDIT.md) lists the rewrite surface (~24 kernels)
-> and the hardest five items. Credits: upstream
-> [Neroued/ninfer](https://github.com/Neroued/ninfer), the
-> [ninfer-3090](https://github.com/Don-Chad/ninfer-3090) down-port playbook,
-> and the [llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906)
-> kernel authors. Upstream README follows.
+**The first AMD/HIP target in the NInfer ecosystem**: porting NInfer to
+gfx906 (AMD Instinct MI50/MI60 32GB, ROCm).
+
+## Branches
+
+| Branch | What it is |
+|---|---|
+| **`gfx906-port`** (default) | **The port. All work happens here.** |
+| `master` | Untouched mirror of upstream [Neroued/ninfer](https://github.com/Neroued/ninfer) at the fork point |
+
+## Status
+
+**Stages 1–3 complete (compiles, not yet hardware-validated):** the entire
+tree — every library and both executables — compiles and links clean for
+gfx906 under ROCm 6.4.1 (`[219/219]`, from-scratch verified). All linear +
+GatedDeltaNet paths are rerouted to tensor-core-free kernels; a wave64
+attention *decode* kernel is drafted (unvalidated). **Next milestone: first
+end-to-end token** — blocked on the GQA *prefill* attention rewrite and
+real-hardware iteration. Details: [`docs/gfx906/PORT-AUDIT.md`](docs/gfx906/PORT-AUDIT.md)
+(kernel census, port order, hardest five) ·
+[`STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md) ·
+[`STAGE3-LOG.md`](docs/gfx906/STAGE3-LOG.md). Contributions welcome.
+
+## What runs on gfx906 (and why "3.6" appears everywhere)
+
+Inside NInfer, **Qwen3.8-27B is a weights-profile of the code target named
+`qwen3_6_27b`** — the two models share identical geometry, so upstream serves
+both from one engine target (see `src/targets/registry.cpp`). That's why the
+source tree and docs say "qwen3_6" even when running the 3.8 model. On gfx906:
+
+| Artifact | gfx906 support |
+|---|---|
+| Qwen3.8-27B `groupwise-int` | ✅ **primary target** (no FP8/NVFP4 tensors — runs as-is, ~17GB on a 32GB card) |
+| Qwen3.6-27B `groupwise-int` | ✅ same engine target, comes along free |
+| Qwen3.8/3.6-27B `nvfp4` | ❌ never — Blackwell-only weight formats |
+| Qwen3.6-35B-A3B (MoE) | ❌ out of scope for now (`sparse_moe` family excluded from the build) |
+
+Credits: upstream [Neroued/ninfer](https://github.com/Neroued/ninfer) ·
+the [ninfer-3090](https://github.com/Don-Chad/ninfer-3090) down-port playbook ·
+[llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906) donor kernels.
+Upstream README follows.
+
+---
 
 # NInfer
 
