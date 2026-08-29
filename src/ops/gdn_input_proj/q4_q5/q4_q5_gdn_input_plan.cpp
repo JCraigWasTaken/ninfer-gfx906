@@ -2,6 +2,7 @@
 
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -25,6 +26,22 @@ struct RouteSpec {
     Q4Q5GdnInputScheduleId schedule;
 };
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: the grouped-mixed mma kernel traps on gfx906. The
+// independent launch (q4_rowsplit_gemv/simt kernels, T in [1,16]) is the only
+// reachable schedule; larger token counts are walked in 16-token slices at
+// execute time. Slow prefill, correct output.
+constexpr std::array<RouteSpec, 1> kRoutes{{
+    {{1, kAnyCols}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
+}};
+
+constexpr bool catalog_is_closed() noexcept {
+    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last == kAnyCols;
+}
+
+// Token-slice width matched to the independent launcher's T-domain [1, 16].
+constexpr std::int32_t kGfx906IndependentSlice = 16;
+#else
 constexpr std::array<RouteSpec, 2> kRoutes{{
     {{1, 16}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
     {{17, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
@@ -34,6 +51,7 @@ constexpr bool catalog_is_closed() noexcept {
     return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
            kRoutes[1].cols.last == kAnyCols;
 }
+#endif // NINFER_GFX906_COMPAT
 
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
 
@@ -113,9 +131,26 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
 
     switch (plan.schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
+#if defined(NINFER_GFX906_COMPAT)
+        // Walk arbitrary token counts through the [1,16]-token kernels. The
+        // dim-0 views are taken per slice; the kernels handle their strided
+        // outputs via the leading dimension exactly as in the fused route.
+        for (std::int32_t offset = 0; offset < problem.cols; offset += kGfx906IndependentSlice) {
+            const std::int32_t count =
+                std::min<std::int32_t>(kGfx906IndependentSlice, problem.cols - offset);
+            const Tensor x_slice   = x.slice(1, offset, count);
+            Tensor qkv_slice       = qkv.slice(1, offset, count);
+            Tensor z_slice         = z.slice(1, offset, count);
+            Tensor qk_slice        = qkv_slice.slice(0, 0, problem.qk_rows);
+            Tensor value_slice     = qkv_slice.slice(0, problem.qk_rows, problem.z_rows);
+            q4_q5_gdn_input_independent_launch(x_slice, qk_weight, value_z_weight, qk_slice,
+                                               value_slice, z_slice, stream);
+        }
+#else
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
         q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
+#endif
         return;
     }
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:

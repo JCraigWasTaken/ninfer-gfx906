@@ -31,6 +31,17 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: SmallTExact rides the q4 small-T mma kernel and
+// the split-half-pair kernels are mma tiles — both trap on gfx906. Reachable
+// schedules: GemvPair (T=1, plain FMA + warp reduction) and Materialized
+// (ops::linear through the compat-rerouted q4 SIMT dispatch, then silu_mul)
+// which covers every T>1.
+constexpr std::array<RouteSpec, 2> kRoutes{{
+    {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
+    {{2, kAnyCols}, Q4LinearSwiGluScheduleId::Materialized},
+}};
+#else
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     {{2, 32}, Q4LinearSwiGluScheduleId::SmallTExact},
@@ -43,6 +54,7 @@ constexpr std::array<RouteSpec, 10> kRoutes{{
     {{513, 640}, Q4LinearSwiGluScheduleId::Materialized},
     {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
 }};
+#endif // NINFER_GFX906_COMPAT
 
 constexpr bool catalog_is_closed() noexcept {
     std::int64_t expected = 1;

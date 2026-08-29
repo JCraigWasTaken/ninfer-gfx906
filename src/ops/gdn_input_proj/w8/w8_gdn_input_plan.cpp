@@ -17,11 +17,21 @@ struct RouteSpec {
     W8GdnInputScheduleId schedule;
 };
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: the split-K and mma schedules trap on gfx906.
+// Only the k=2048 decode kernel (T=1) is reachable; T>1 is walked one token
+// per launch at dispatch time. Slow prefill, correct output (this family is
+// the 35B target's — the 27B routes through the q4_q5 split overloads).
+constexpr std::array<RouteSpec, 1> kRoutes{{
+    {1, kAnyCols, W8GdnInputScheduleId::DecodeR8Direct},
+}};
+#else
 constexpr std::array<RouteSpec, 3> kRoutes{{
     {1, 1, W8GdnInputScheduleId::DecodeR8Direct},
     {2, 96, W8GdnInputScheduleId::SplitKMmaDirect},
     {97, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
 }};
+#endif // NINFER_GFX906_COMPAT
 
 constexpr bool catalog_is_closed() {
     std::int64_t expected = 1;
@@ -98,7 +108,16 @@ void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
     const W8GdnInputPlan plan = w8_gdn_input_resolve_plan(problem);
     switch (plan.schedule) {
     case W8GdnInputScheduleId::DecodeR8Direct:
+#if defined(NINFER_GFX906_COMPAT)
+        for (std::int32_t offset = 0; offset < x.ne[1]; ++offset) {
+            const Tensor x_slice = x.slice(1, offset, 1);
+            Tensor qkv_slice     = qkv.slice(1, offset, 1);
+            Tensor z_slice       = z.slice(1, offset, 1);
+            w8_gdn_input_decode_launch(x_slice, weight, qkv_slice, z_slice, stream);
+        }
+#else
         w8_gdn_input_decode_launch(x, weight, qkv, z, stream);
+#endif
         return;
     case W8GdnInputScheduleId::SplitKMmaDirect:
         w8_gdn_input_splitk_mma_launch(x, weight, qkv, z, stream);

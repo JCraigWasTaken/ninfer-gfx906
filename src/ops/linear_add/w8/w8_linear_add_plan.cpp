@@ -18,6 +18,20 @@ struct RouteSpec {
     W8LinearAddScheduleId schedule;
 };
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: the split-K and mma residual schedules trap on
+// gfx906. Reachable schedules: the decode kernel at T=1 (k=6144) and the
+// shape-generic SIMT residual schedule everywhere else. Slow prefill,
+// correct output.
+constexpr std::array<RouteSpec, 1> kK4096Routes{{
+    {1, kAnyCols, W8LinearAddScheduleId::SimtR8C4},
+}};
+
+constexpr std::array<RouteSpec, 2> kK6144Routes{{
+    {1, 1, W8LinearAddScheduleId::DecodeR16},
+    {2, kAnyCols, W8LinearAddScheduleId::SimtR8C4},
+}};
+#else
 constexpr std::array<RouteSpec, 5> kK4096Routes{{
     {1, 1, W8LinearAddScheduleId::SimtR8C4},
     {2, 48, W8LinearAddScheduleId::SplitKMmaExactT},
@@ -61,6 +75,7 @@ constexpr std::array<RouteSpec, 33> kK6144Routes{{
     {2048, 2048, W8LinearAddScheduleId::MmaR64C128},
     {2049, kAnyCols, W8LinearAddScheduleId::MmaR64C128},
 }};
+#endif // NINFER_GFX906_COMPAT
 
 template <std::size_t N>
 constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {

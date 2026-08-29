@@ -17,6 +17,20 @@ struct RouteSpec {
     W8AttnInputScheduleId schedule;
 };
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: the split-K and mma schedules trap on gfx906.
+// Reachable schedules: the k=2048 decode kernel at T=1 and the shape-generic
+// SIMT split-output schedule for every T>1. Slow prefill, correct output.
+constexpr std::array<RouteSpec, 2> kTargetRoutes{{
+    {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
+    {2, kAnyCols, W8AttnInputScheduleId::SimtR8C4},
+}};
+
+constexpr std::array<RouteSpec, 2> kCompanionRoutes{{
+    {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
+    {2, kAnyCols, W8AttnInputScheduleId::SimtR8C4},
+}};
+#else
 constexpr std::array<RouteSpec, 4> kTargetRoutes{{
     {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
     {2, 64, W8AttnInputScheduleId::SplitKMmaDirect},
@@ -35,6 +49,7 @@ constexpr std::array<RouteSpec, 9> kCompanionRoutes{{
     {449, 560, W8AttnInputScheduleId::MmaR128C80},
     {561, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
+#endif // NINFER_GFX906_COMPAT
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) {

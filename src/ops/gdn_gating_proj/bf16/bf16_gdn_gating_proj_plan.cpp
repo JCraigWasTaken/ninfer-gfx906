@@ -26,6 +26,25 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: the cooperative mma kernels trap on gfx906.
+// 27B geometry: GEMV at T=1, and the split-10 small-T kernel — whose grid
+// already tiles tokens (grid.z = div_up(t, kSmallTMax)) — for every T>1.
+// 35B geometry: the shape-generic SIMT kernels, legal up to
+// ColsPerTile * 65535 tokens; the residual MmaUnsplit tail beyond 524280
+// tokens is far outside any real prefill chunk and is documented as
+// unreachable in docs/gfx906/STAGE3-LOG.md.
+constexpr std::array<RouteSpec, 2> k27Routes{{
+    {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
+    {{2, kAnyCols}, Bf16GdnGatingScheduleId::SmallTSplit10},
+}};
+
+constexpr std::array<RouteSpec, 3> k35Routes{{
+    {{1, 4}, Bf16GdnGatingScheduleId::SimtWarpRowC4},
+    {{5, 8 * 65'535}, Bf16GdnGatingScheduleId::SimtWarpRowC8},
+    {{8 * 65'535 + 1, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+}};
+#else
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
@@ -46,6 +65,7 @@ constexpr std::array<RouteSpec, 5> k35Routes{{
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
+#endif // NINFER_GFX906_COMPAT
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
@@ -148,7 +168,13 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::GemvPairedRows:
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
+#if defined(NINFER_GFX906_COMPAT)
+            // The split-10 launcher tiles tokens itself (grid.z), so it is
+            // legal for every T >= 2 on gfx906 where the mma routes are gone.
+            return problem.cols >= 2;
+#else
             return problem.cols >= 2 && problem.cols <= 8;
+#endif
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
@@ -383,7 +409,14 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
-    if (is_35(problem) && problem.cols <= 16) {
+#if defined(NINFER_GFX906_COMPAT)
+    // The fused norm+gating kernel is an mma cooperative kernel; always take
+    // the Composed route (rmsnorm + the rerouted control plan) on gfx906.
+    constexpr bool kAllowFusedNormGating = false;
+#else
+    constexpr bool kAllowFusedNormGating = true;
+#endif
+    if (kAllowFusedNormGating && is_35(problem) && problem.cols <= 16) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;

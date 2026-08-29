@@ -2,6 +2,7 @@
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -36,6 +37,25 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: the residual mma kernels trap on gfx906. Only the
+// GEMV (T=1) and split2-exact SIMT (small-T) kernels are reachable; token
+// counts beyond the split2 domain are walked in 8-token slices at execute
+// time (8 is inside both k-shapes' tuned split2 ranges). Slow prefill,
+// correct output.
+constexpr std::array<RouteSpec, 2> kK6144Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
+    {{2, kAnyCols}, Q5LinearAddScheduleId::Split2ExactResidual},
+}};
+
+constexpr std::array<RouteSpec, 2> kK17408Routes{{
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
+    {{2, kAnyCols}, Q5LinearAddScheduleId::Split2ExactResidual},
+}};
+
+// Token-slice width inside the split2-exact launcher's instantiated domain.
+constexpr std::int32_t kGfx906Split2Slice = 8;
+#else
 constexpr std::array<RouteSpec, 6> kK6144Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
@@ -53,6 +73,7 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
+#endif // NINFER_GFX906_COMPAT
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
@@ -142,7 +163,23 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         q5_linear_add_gemv_residual_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::Split2ExactResidual:
+#if defined(NINFER_GFX906_COMPAT)
+        // Walk arbitrary token counts through the split2-exact SIMT kernel in
+        // 8-token slices (a leftover single token uses the GEMV kernel).
+        for (std::int32_t offset = 0; offset < problem.cols; offset += kGfx906Split2Slice) {
+            const std::int32_t count =
+                std::min<std::int32_t>(kGfx906Split2Slice, problem.cols - offset);
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor residual_slice = residual_out.slice(1, offset, count);
+            if (count == 1) {
+                q5_linear_add_gemv_residual_launch(x_slice, w, residual_slice, stream);
+            } else {
+                q5_linear_add_split2_exact_launch(x_slice, w, residual_slice, stream);
+            }
+        }
+#else
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
+#endif
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);

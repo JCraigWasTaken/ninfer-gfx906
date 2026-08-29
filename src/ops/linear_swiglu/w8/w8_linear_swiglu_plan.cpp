@@ -17,6 +17,15 @@ struct RouteSpec {
     W8LinearSwiGluScheduleId schedule;
 };
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: the split-K and mma pair schedules trap on
+// gfx906. Only the decode pair kernel (T=1) is reachable; T>1 is walked one
+// token per launch at execute time. Slow prefill, correct output (this
+// family is the 35B target's MLP — the 27B routes through q4 linear_swiglu).
+constexpr std::array<RouteSpec, 1> kRoutes{{
+    {1, kAnyCols, W8LinearSwiGluScheduleId::DecodePairR16},
+}};
+#else
 constexpr std::array<RouteSpec, 18> kRoutes{{
     {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
     {2, 48, W8LinearSwiGluScheduleId::SplitKMmaExactT},
@@ -37,6 +46,7 @@ constexpr std::array<RouteSpec, 18> kRoutes{{
     {513, 560, W8LinearSwiGluScheduleId::MmaR128C80},
     {561, kAnyCols, W8LinearSwiGluScheduleId::MmaR64C128},
 }};
+#endif // NINFER_GFX906_COMPAT
 
 constexpr bool catalog_is_closed() {
     std::int64_t expected = 1;
@@ -112,7 +122,15 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
     }
     switch (plan.schedule) {
     case W8LinearSwiGluScheduleId::DecodePairR16:
+#if defined(NINFER_GFX906_COMPAT)
+        for (std::int32_t offset = 0; offset < problem.cols; ++offset) {
+            const Tensor x_slice = x.slice(1, offset, 1);
+            Tensor out_slice     = out.slice(1, offset, 1);
+            w8_linear_swiglu_decode_pair_r16_launch(x_slice, w, out_slice, stream);
+        }
+#else
         w8_linear_swiglu_decode_pair_r16_launch(x, w, out, stream);
+#endif
         return;
     case W8LinearSwiGluScheduleId::SplitKMmaExactT:
         w8_linear_swiglu_splitk_exact_t_launch(x, w, out, stream);

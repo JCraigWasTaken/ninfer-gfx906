@@ -21,6 +21,22 @@ struct W8PairRouteSpec {
     W8PairScheduleId schedule;
 };
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: every mma/split-K pair schedule traps on gfx906.
+// Reachable schedules: the two shape-generic SIMT pair schedules (token-
+// sliced by launch_tiled) and, for k=2048 decode, the plain dual decode
+// kernel. Slow prefill, correct output.
+constexpr std::array<W8PairRouteSpec, 2> kK5120Routes{{
+    {1, 4, W8PairScheduleId::TwoSimtR8C4},
+    {5, kAnyCols, W8PairScheduleId::TwoSimtR8C8},
+}};
+
+constexpr std::array<W8PairRouteSpec, 3> kK2048Routes{{
+    {1, 1, W8PairScheduleId::DualDecodeR4},
+    {2, 4, W8PairScheduleId::TwoSimtR8C4},
+    {5, kAnyCols, W8PairScheduleId::TwoSimtR8C8},
+}};
+#else
 constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
     {1, 4, W8PairScheduleId::TwoSimtR8C4},
     {5, 56, W8PairScheduleId::TwoSimtR8C8},
@@ -66,6 +82,7 @@ constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
     {2209, 2270, W8PairScheduleId::ExactConcatMmaR96C96},
     {2271, kAnyCols, W8PairScheduleId::ConcatMmaR64C128},
 }};
+#endif // NINFER_GFX906_COMPAT
 
 template <std::size_t N>
 constexpr bool routes_are_closed(const std::array<W8PairRouteSpec, N>& routes) noexcept {

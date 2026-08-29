@@ -1,6 +1,7 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -24,6 +25,22 @@ struct RouteSpec {
     Q4Q5AttnInputScheduleId schedule;
 };
 
+#if defined(NINFER_GFX906_COMPAT)
+// gfx906 stage-3 rerouting: the grouped-pair mma kernels trap on gfx906. The
+// small-T kernel (ParentSplitFixed -> q4_rowsplit_gemv/simt split-output
+// kernels, T in [1,16]) is the only reachable schedule; larger token counts
+// are walked in 16-token slices at execute time. Slow prefill, correct output.
+constexpr std::array<RouteSpec, 1> kRoutes{{
+    {{1, kAnyCols}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
+}};
+
+constexpr bool catalog_is_closed() noexcept {
+    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last == kAnyCols;
+}
+
+// Token-slice width matched to the small-T launcher's T-domain [1, 16].
+constexpr std::int32_t kGfx906SmallTSlice = 16;
+#else
 constexpr std::array<RouteSpec, 3> kRoutes{{
     {{1, 16}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
     {{17, 20}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3},
@@ -34,6 +51,7 @@ constexpr bool catalog_is_closed() noexcept {
     return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
            kRoutes[1].cols.last + 1 == kRoutes[2].cols.first && kRoutes[2].cols.last == kAnyCols;
 }
+#endif // NINFER_GFX906_COMPAT
 
 static_assert(catalog_is_closed(), "attention input routes must be exact and closed");
 
@@ -86,8 +104,23 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
 
     switch (plan.schedule) {
     case Q4Q5AttnInputScheduleId::ParentSplitFixed:
+#if defined(NINFER_GFX906_COMPAT)
+        // Walk arbitrary token counts through the [1,16]-token kernel.
+        for (std::int32_t offset = 0; offset < problem.cols; offset += kGfx906SmallTSlice) {
+            const std::int32_t count =
+                std::min<std::int32_t>(kGfx906SmallTSlice, problem.cols - offset);
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor q_slice       = q.slice(1, offset, count);
+            Tensor gate_slice    = gate.slice(1, offset, count);
+            Tensor k_slice       = k.slice(1, offset, count);
+            Tensor v_slice       = v.slice(1, offset, count);
+            q4_q5_attn_input_small_t_launch(x_slice, query_key_weight, gate_value_weight, q_slice,
+                                            gate_slice, k_slice, v_slice, stream);
+        }
+#else
         q4_q5_attn_input_small_t_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                         stream);
+#endif
         return;
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3:
         q4_q5_attn_input_grouped_mma_r16_c64_s3_launch(x, query_key_weight, gate_value_weight, q,
