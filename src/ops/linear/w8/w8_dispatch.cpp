@@ -4,6 +4,30 @@
 
 namespace ninfer::ops::detail {
 
+#if defined(NINFER_GFX906_COMPAT)
+namespace {
+
+// gfx906 stage-3 reachability registry: the complete set of W8 launches the
+// compat selector may return. All are wave64-safe (decode/SIMT); none pulls in
+// ops/common/mma.cuh, w8_small_t_mma.cuh, or the medium-T split-K kernel,
+// whose bodies trap on gfx906. Any launch the RTX-5090-tuned whitelist picks
+// outside this registry is rerouted to the shape-generic SIMT GEMM.
+constexpr W8Launch kGfx906ReachableW8Launches[] = {
+    launch_w8_decode_r4,   // [n=2048, k=16384], T=1 only (shape-checked inside)
+    launch_w8_simt_r8_c4,  // generic (n, k, t)
+    launch_w8_simt_r8_c8,  // generic (n, k, t)
+};
+
+W8Launch gfx906_reroute(W8Launch launch, std::int32_t t) {
+    for (const W8Launch safe : kGfx906ReachableW8Launches) {
+        if (launch == safe) { return launch; }
+    }
+    return t <= 4 ? launch_w8_simt_r8_c4 : launch_w8_simt_r8_c8;
+}
+
+} // namespace
+#endif // NINFER_GFX906_COMPAT
+
 W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
 
@@ -148,7 +172,13 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
+#if defined(NINFER_GFX906_COMPAT)
+        // Keep the (n, k, t) whitelist as the shape gate, then force the
+        // selection onto a gfx906-reachable kernel.
+        return gfx906_reroute(select_w8_a16_launch(n, k, t), t);
+#else
         return select_w8_a16_launch(n, k, t);
+#endif
     case LinearPolicy::AllowA4:
         break;
     }

@@ -4,6 +4,28 @@
 
 namespace ninfer::ops::detail {
 
+#if defined(NINFER_GFX906_COMPAT)
+namespace {
+
+// gfx906 stage-3 reachability registry: the complete set of Q6 launches the
+// compat selector may return. All five SIMT GEMM schedules are shape-generic
+// (grids sized with div_up + token slicing); the rowsplit mma tiles trap on
+// gfx906 and are rerouted.
+constexpr Q6Launch kGfx906ReachableQ6Launches[] = {
+    launch_q6_simt_r8_c4, launch_q6_simt_r8_c5, launch_q6_simt_r8_c6,
+    launch_q6_simt_r8_c7, launch_q6_simt_r8_c8,
+};
+
+Q6Launch gfx906_reroute(Q6Launch launch, std::int32_t t) {
+    for (const Q6Launch safe : kGfx906ReachableQ6Launches) {
+        if (launch == safe) { return launch; }
+    }
+    return t <= 4 ? launch_q6_simt_r8_c4 : launch_q6_simt_r8_c8;
+}
+
+} // namespace
+#endif // NINFER_GFX906_COMPAT
+
 Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("q6 linear: unsupported shape or T"); }
 
@@ -66,7 +88,13 @@ Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     switch (policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
+#if defined(NINFER_GFX906_COMPAT)
+        // Keep the (n, k, t) whitelist as the shape gate, then force the
+        // selection onto a gfx906-reachable kernel.
+        return gfx906_reroute(select_q6_a16_launch(n, k, t), t);
+#else
         return select_q6_a16_launch(n, k, t);
+#endif
     case LinearPolicy::AllowA4:
         break;
     }
