@@ -4,6 +4,9 @@
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/kernel/gqa_attention_decode_bf16_gfx906.cuh"
+#endif
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
@@ -92,9 +95,18 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
     Tensor& cache_v = cache.v_pages;
+#if defined(NINFER_GFX906_COMPAT)
+    // gfx906 stage-4 DRAFT (UNVALIDATED on hardware): the tensor-core partial
+    // kernel is replaced by the wave64 SIMT kernel with the identical launch
+    // and partial-output contract; the mma-free split reducer is unchanged.
+    // The INT8-KV path below still traps (port-order step 7).
+    gqa_attention_small_t_simt_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
+                                                   Masked, CacheInput><<<grid, kBlock, 0, stream>>>(
+#else
     // bf16 kernel uses only static smem (no dynamic staging).
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
                                                  Masked, CacheInput><<<grid, kBlock, 0, stream>>>(
+#endif
         static_cast<const __nv_bfloat16*>(q.data), input,
         static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
         static_cast<__nv_bfloat16*>(cache_v.data),
