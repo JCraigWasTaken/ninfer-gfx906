@@ -5,15 +5,16 @@ the first AMD target in the NInfer ecosystem.
 
 ## Status
 
-**Stages 1–7 complete: runs end-to-end on a real MI50** — first tokens
-validated against llama.cpp on the same card (stage 4), HIP graphs on with
-bit-identical greedy output (5), MTP speculative decoding working at 40–95%
-acceptance (6), and a first int8-KV attention path via `v_dot4_i32_i8` (7).
-Throughput is bring-up grade — the grouped-int prefill GEMM rewrites and
-MI50 retuning (steps 8–10) are next.
+**Stages 1–8 complete: fast prefill and working speculation on a real MI50**
+— end-to-end tokens validated against llama.cpp (stage 4), HIP graphs (5),
+MTP speculative decoding (6), int8-KV attention (7), and the wave64
+LDS-tiled grouped-int GEMM rewrites (8): prefill ~9 → ~170 tok/s on the
+stage-4 probe and MTP now beats plain decode (code, draft 3: ~24 vs ~13
+tok/s). Attention/dispatch retuning (step 10) is next; GDN chunked prefill
+(9) is deferred on measurement (~5% of prefill).
 
 - [`docs/gfx906/PORT-AUDIT.md`](docs/gfx906/PORT-AUDIT.md) — kernel census, port order, donor map
-- [`docs/gfx906/STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md) · [`STAGE3-LOG.md`](docs/gfx906/STAGE3-LOG.md) · [`STAGE4-LOG.md`](docs/gfx906/STAGE4-LOG.md) · [`STAGE5-7-LOG.md`](docs/gfx906/STAGE5-7-LOG.md) — stage logs
+- [`docs/gfx906/STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md) · [`STAGE3-LOG.md`](docs/gfx906/STAGE3-LOG.md) · [`STAGE4-LOG.md`](docs/gfx906/STAGE4-LOG.md) · [`STAGE5-7-LOG.md`](docs/gfx906/STAGE5-7-LOG.md) · [`STAGE8-9-LOG.md`](docs/gfx906/STAGE8-9-LOG.md) — stage logs
 
 Contributions welcome.
 
