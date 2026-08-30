@@ -642,8 +642,18 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
+#if defined(NINFER_GFX906_COMPAT)
+        // ROCm 6.4 hipGraph capture/instantiation materializes ~3x the device
+        // memory the CUDA-tuned tiers below plan for (measured 36 MiB against
+        // the 12 MiB ordinary tier: batch 1, context 2048, MI50). Scale every
+        // tier 4x; the allowance feeds the device reservation, so the margin
+        // costs planned VRAM but never correctness.
+        constexpr std::size_t kGraphAllowanceScale = 4;
+#else
+        constexpr std::size_t kGraphAllowanceScale = 1;
+#endif
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
+            impl->graph_allowance_bytes = checked_mul(kGraphAllowanceScale * 12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
@@ -653,7 +663,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                    return kGraphAllowanceScale * (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
@@ -668,7 +678,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity,
                             static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                        return kGraphAllowanceScale * (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
                     },
                     "DFlash graph allowance");
             };
