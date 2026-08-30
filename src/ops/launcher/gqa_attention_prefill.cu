@@ -4,10 +4,14 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_prefill_bf16.cuh"
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/kernel/gqa_attention_prefill_bf16_gfx906.cuh"
+#endif
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -19,6 +23,28 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                                cudaStream_t stream) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
+#if defined(NINFER_GFX906_COMPAT)
+    // gfx906 stage 4: the tensor-core prefill kernels' dynamic-smem arenas
+    // (96 KiB bf16) exceed the 64 KiB/CU LDS limit and their bodies trap
+    // (ldmatrix/mma stubs). Route bf16 KV to the wave64 SIMT kernel — static
+    // LDS, its own Br=32 grid geometry, no attribute bump. int8-KV prefill
+    // attention is port-order step 7.
+    if (cache.dtype == DType::I8) {
+        throw std::runtime_error(
+            "gfx906: int8-KV GQA prefill attention is not ported yet (run with bf16 KV)");
+    }
+    const auto tokens = static_cast<std::int32_t>(q.ne[2]);
+    const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillSimtBr)),
+                              static_cast<unsigned>(Geometry::QHeads), 1u);
+    gqa_attention_prefill_simt_bf16_kernel<Geometry, Metadata>
+        <<<attention_grid, kGqaPrefillSimtThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data),
+            static_cast<const __nv_bfloat16*>(cache_k.data),
+            static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
+            static_cast<const std::int32_t*>(positions.data), scale,
+            static_cast<__nv_bfloat16*>(out.data), tokens);
+    CUDA_CHECK(cudaGetLastError());
+#else
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
     static const cudaError_t attr_bf16 =
         cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
@@ -56,6 +82,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     }
     CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 template <typename Geometry, typename CacheView, typename Metadata>
