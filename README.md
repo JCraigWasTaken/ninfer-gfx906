@@ -30,9 +30,8 @@ Inside NInfer, **Qwen3.8-27B is a weights-profile of the code target named
 both from one engine target (see `src/targets/registry.cpp`). That's why the
 source tree and docs say "qwen3_6" even when running the 3.8 model. On gfx906:
 
-Supported on gfx906: the `groupwise-int` artifacts of **Qwen3.8-27B**
-(primary target — ~17GB, fits a 32GB card) and **Qwen3.6-27B** (same engine
-target). The NVFP4 artifacts and the 35B MoE are not part of this port.
+Supported on gfx906: the **Qwen3.8-27B `groupwise-int`** artifact (~17GB,
+fits a 32GB card). Other upstream artifacts are not part of this port.
 
 Credits: upstream [Neroued/ninfer](https://github.com/Neroued/ninfer) ·
 the [ninfer-3090](https://github.com/Don-Chad/ninfer-3090) down-port playbook ·
