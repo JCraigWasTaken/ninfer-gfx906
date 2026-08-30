@@ -6,6 +6,7 @@
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #if defined(NINFER_GFX906_COMPAT)
 #include "ops/kernel/gqa_attention_decode_bf16_gfx906.cuh"
+#include "ops/kernel/gqa_attention_decode_i8_gfx906.cuh"
 #endif
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
@@ -133,6 +134,36 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_v       = cache.v_pages;
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
+#if defined(NINFER_GFX906_COMPAT)
+    // gfx906 step 7: the tensor-core int8 producer/consumer kernel is replaced
+    // by the wave64 SIMT int8 kernel (sdot4 QK, inline V dequant) with the
+    // bf16 SIMT kernel's launch shape. Its active-split policy matches the
+    // reducer's Int8=true policy; the launcher split count already uses the
+    // int8 tiers.
+    (void)implementation_window;
+    constexpr int kSimtWarps = 4;
+    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+    gqa_attention_small_t_simt_partial_i8_kernel<Geometry, TokenTile, kSimtWarps, MultiBatch,
+                                                 Masked, CacheInput>
+        <<<grid, kSimtWarps * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
+            static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
+            static_cast<__half*>(cache_v_scale.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width,
+            invocation.column_begin, logical_capacity, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+    return;
+#endif
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr std::size_t kDynamicBytes =

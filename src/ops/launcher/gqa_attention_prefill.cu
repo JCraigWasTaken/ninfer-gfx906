@@ -6,6 +6,7 @@
 #include "ops/kernel/gqa_attention_prefill_bf16.cuh"
 #if defined(NINFER_GFX906_COMPAT)
 #include "ops/kernel/gqa_attention_prefill_bf16_gfx906.cuh"
+#include "ops/kernel/gqa_attention_prefill_i8_gfx906.cuh"
 #endif
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
@@ -29,13 +30,26 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     // (ldmatrix/mma stubs). Route bf16 KV to the wave64 SIMT kernel — static
     // LDS, its own Br=32 grid geometry, no attribute bump. int8-KV prefill
     // attention is port-order step 7.
-    if (cache.dtype == DType::I8) {
-        throw std::runtime_error(
-            "gfx906: int8-KV GQA prefill attention is not ported yet (run with bf16 KV)");
-    }
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillSimtBr)),
                               static_cast<unsigned>(Geometry::QHeads), 1u);
+    if (cache.dtype == DType::I8) {
+        // gfx906 step 7: wave64 SIMT int8 prefill attention (sdot4 QK path,
+        // V dequantized at staging); same grid shape as the bf16 SIMT kernel.
+        const Tensor& cache_k_scale = cache.k_scale_pages;
+        const Tensor& cache_v_scale = cache.v_scale_pages;
+        gqa_attention_prefill_simt_i8_kernel<Geometry, Metadata>
+            <<<attention_grid, kGqaPrefillSimtThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const std::int8_t*>(cache_k.data),
+                static_cast<const std::int8_t*>(cache_v.data),
+                static_cast<const __half*>(cache_k_scale.data),
+                static_cast<const __half*>(cache_v_scale.data), metadata,
+                static_cast<const std::int32_t*>(positions.data), scale,
+                static_cast<__nv_bfloat16*>(out.data), tokens);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     gqa_attention_prefill_simt_bf16_kernel<Geometry, Metadata>
         <<<attention_grid, kGqaPrefillSimtThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
