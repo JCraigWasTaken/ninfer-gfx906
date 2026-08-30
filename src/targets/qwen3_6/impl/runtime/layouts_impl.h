@@ -643,12 +643,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
 #if defined(NINFER_GFX906_COMPAT)
-        // ROCm 6.4 hipGraph capture/instantiation materializes ~3x the device
-        // memory the CUDA-tuned tiers below plan for (measured 36 MiB against
-        // the 12 MiB ordinary tier: batch 1, context 2048, MI50). Scale every
-        // tier 4x; the allowance feeds the device reservation, so the margin
-        // costs planned VRAM but never correctness.
-        constexpr std::size_t kGraphAllowanceScale = 4;
+        // ROCm 6.4 hipGraph capture/instantiation materializes several times
+        // the device memory the CUDA-tuned tiers below plan for (measured on
+        // MI50 at batch 1, context 2048: 36 MiB against the 12 MiB ordinary
+        // tier, 51 MiB against the 12 MiB MTP tier). Scale every tier 8x; the
+        // allowance feeds the device reservation, so the margin costs planned
+        // VRAM but never correctness.
+        constexpr std::size_t kGraphAllowanceScale = 8;
 #else
         constexpr std::size_t kGraphAllowanceScale = 1;
 #endif
