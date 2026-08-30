@@ -10,6 +10,12 @@ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream);
 
+// gfx906 stage-8 wave64 LDS-tiled GEMMs (one launch per weight, any T): the
+// Q4 plane fills qk, the Q5 plane split-stores into value and z.
+void q4_q5_gdn_input_tiled_gfx906_launch(const Tensor& x, const Weight& qk_weight,
+                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
+                                         Tensor& z, cudaStream_t stream);
+
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
                                         cudaStream_t stream);

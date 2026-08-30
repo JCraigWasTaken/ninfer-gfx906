@@ -1,6 +1,11 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
+
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -34,8 +39,20 @@ constexpr std::array<RouteSpec, 1> kRoutes{{
     {{1, kAnyCols}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
 }};
 
+// Stage-8 routing: one wave64 LDS-tiled GEMM per parent weight for every
+// T > 1 (the Q5 half's split4/simt fallbacks lose to the tiled kernel from
+// T=2 up, and by far more than the Q4 half's small-T fallback gains).
+// Selected at runtime by the NINFER_GFX906_STAGE8 gate.
+constexpr std::array<RouteSpec, 2> kRoutesTiled{{
+    {{1, 1}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
+    {{2, kAnyCols}, Q4Q5AttnInputScheduleId::TiledGfx906},
+}};
+
 constexpr bool catalog_is_closed() noexcept {
-    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last == kAnyCols;
+    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last == kAnyCols &&
+           kRoutesTiled[0].cols.first == 1 &&
+           kRoutesTiled[0].cols.last + 1 == kRoutesTiled[1].cols.first &&
+           kRoutesTiled[1].cols.last == kAnyCols;
 }
 
 // Token-slice width matched to the small-T launcher's T-domain [1, 16].
@@ -66,6 +83,8 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
     switch (schedule) {
     case Q4Q5AttnInputScheduleId::ParentSplitFixed:
         return "attn_input_proj.q4_q5.parent_split_fixed";
+    case Q4Q5AttnInputScheduleId::TiledGfx906:
+        return "attn_input_proj.q4_q5.tiled.gfx906";
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3:
         return "attn_input_proj.q4_q5.grouped_homogeneous_pair.mma.r16.c64.s3";
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4:
@@ -84,6 +103,15 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
             "Q4/Q5 attention input: exact problem or column count is not admitted");
     }
 
+#if defined(NINFER_GFX906_COMPAT)
+    if (gfx906_stage8_tiled_enabled()) {
+        for (const RouteSpec& route : kRoutesTiled) {
+            if (!route.cols.contains(problem.cols)) { continue; }
+            return {route.schedule};
+        }
+        throw std::logic_error("Q4/Q5 attention input: admitted problem has no covering route");
+    }
+#endif
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }
         return {route.schedule};
@@ -121,6 +149,10 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
         q4_q5_attn_input_small_t_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                         stream);
 #endif
+        return;
+    case Q4Q5AttnInputScheduleId::TiledGfx906:
+        q4_q5_attn_input_tiled_gfx906_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                             stream);
         return;
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3:
         q4_q5_attn_input_grouped_mma_r16_c64_s3_launch(x, query_key_weight, gate_value_weight, q,

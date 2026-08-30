@@ -10,6 +10,7 @@
 namespace ninfer::ops::detail {
 
 enum class Q4Q5GdnInputScheduleId {
+    TiledGfx906,
     IndependentDirectFixed,
     GroupedMixedMmaR64C128,
 };

@@ -2,6 +2,10 @@
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -55,6 +59,19 @@ constexpr std::array<RouteSpec, 2> kK17408Routes{{
 
 // Token-slice width inside the split2-exact launcher's instantiated domain.
 constexpr std::int32_t kGfx906Split2Slice = 8;
+
+// Stage-8 routing: the wave64 LDS-tiled GEMM with fused residual accumulate
+// replaces the sliced split2 walk for every T > 1 (both k shapes are
+// stage-aligned). Selected at runtime by the NINFER_GFX906_STAGE8 gate.
+constexpr std::array<RouteSpec, 2> kK6144RoutesTiled{{
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
+    {{2, kAnyCols}, Q5LinearAddScheduleId::TiledResidualGfx906},
+}};
+
+constexpr std::array<RouteSpec, 2> kK17408RoutesTiled{{
+    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
+    {{2, kAnyCols}, Q5LinearAddScheduleId::TiledResidualGfx906},
+}};
 #else
 constexpr std::array<RouteSpec, 6> kK6144Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
@@ -88,6 +105,10 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcep
 
 static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
               "Q5 LinearAdd routes must be exact, contiguous, and closed");
+#if defined(NINFER_GFX906_COMPAT)
+static_assert(catalog_is_closed(kK6144RoutesTiled) && catalog_is_closed(kK17408RoutesTiled),
+              "Q5 LinearAdd gfx906 tiled routes must be exact, contiguous, and closed");
+#endif
 
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
     for (const SupportSpec& support : kSupports) {
@@ -107,6 +128,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.gemv.residual";
     case Q5LinearAddScheduleId::Split2ExactResidual:
         return "linear_add.q5.simt.split2.exact.residual";
+    case Q5LinearAddScheduleId::TiledResidualGfx906:
+        return "linear_add.q5.tiled.gfx906.residual";
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         return "linear_add.q5.mma.r64.c16.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C24:
@@ -134,6 +157,12 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         }
         throw std::logic_error("q5 linear_add: admitted problem has no covering route");
     };
+#if defined(NINFER_GFX906_COMPAT)
+    if (gfx906_stage8_tiled_enabled()) {
+        return problem.k == 6144 ? resolve_from(kK6144RoutesTiled)
+                                 : resolve_from(kK17408RoutesTiled);
+    }
+#endif
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
 }
 
@@ -180,6 +209,9 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
 #else
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
 #endif
+        return;
+    case Q5LinearAddScheduleId::TiledResidualGfx906:
+        q5_linear_add_tiled_gfx906_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);

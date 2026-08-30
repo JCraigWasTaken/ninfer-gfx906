@@ -2,6 +2,10 @@
 
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -35,8 +39,20 @@ constexpr std::array<RouteSpec, 1> kRoutes{{
     {{1, kAnyCols}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
 }};
 
+// Stage-8 routing: one wave64 LDS-tiled GEMM per weight for every T > 1 (the
+// Q5 value/z half's split4/simt fallbacks lose to the tiled kernel from T=2
+// up, by far more than the Q4 half's small-T fallback gains). Selected at
+// runtime by the NINFER_GFX906_STAGE8 gate.
+constexpr std::array<RouteSpec, 2> kRoutesTiled{{
+    {{1, 1}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
+    {{2, kAnyCols}, Q4Q5GdnInputScheduleId::TiledGfx906},
+}};
+
 constexpr bool catalog_is_closed() noexcept {
-    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last == kAnyCols;
+    return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last == kAnyCols &&
+           kRoutesTiled[0].cols.first == 1 &&
+           kRoutesTiled[0].cols.last + 1 == kRoutesTiled[1].cols.first &&
+           kRoutesTiled[1].cols.last == kAnyCols;
 }
 
 // Token-slice width matched to the independent launcher's T-domain [1, 16].
@@ -66,6 +82,8 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
     switch (schedule) {
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
         return "gdn_input_proj.q4_q5.independent_direct_fixed";
+    case Q4Q5GdnInputScheduleId::TiledGfx906:
+        return "gdn_input_proj.q4_q5.tiled.gfx906";
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r64.c128";
     }
@@ -92,6 +110,15 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
             "Q4/Q5 GDN input: exact problem or column count is not admitted");
     }
 
+#if defined(NINFER_GFX906_COMPAT)
+    if (gfx906_stage8_tiled_enabled()) {
+        for (const RouteSpec& route : kRoutesTiled) {
+            if (!route.cols.contains(problem.cols)) { continue; }
+            return {route.schedule};
+        }
+        throw std::logic_error("Q4/Q5 GDN input: admitted problem has no covering route");
+    }
+#endif
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }
         return {route.schedule};
@@ -151,6 +178,12 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
         q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
 #endif
+        return;
+    }
+    case Q4Q5GdnInputScheduleId::TiledGfx906: {
+        Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
+        Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+        q4_q5_gdn_input_tiled_gfx906_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;
     }
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
