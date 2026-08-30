@@ -5,15 +5,15 @@ the first AMD target in the NInfer ecosystem.
 
 ## Status
 
-**Stages 1–3 complete: the full tree compiles and links clean for gfx906**
-(ROCm 6.4.1, `[219/219]`, from-scratch verified) with all execution paths
-rerouted to tensor-core-free kernels. **Not yet hardware-validated** — no
-performance numbers exist for this port yet. Next milestone: first end-to-end
-token (blocked on the GQA prefill attention rewrite + real-hardware
-iteration).
+**Stages 1–7 complete: runs end-to-end on a real MI50** — first tokens
+validated against llama.cpp on the same card (stage 4), HIP graphs on with
+bit-identical greedy output (5), MTP speculative decoding working at 40–95%
+acceptance (6), and a first int8-KV attention path via `v_dot4_i32_i8` (7).
+Throughput is bring-up grade — the grouped-int prefill GEMM rewrites and
+MI50 retuning (steps 8–10) are next.
 
 - [`docs/gfx906/PORT-AUDIT.md`](docs/gfx906/PORT-AUDIT.md) — kernel census, port order, donor map
-- [`docs/gfx906/STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md) · [`STAGE3-LOG.md`](docs/gfx906/STAGE3-LOG.md) — build logs
+- [`docs/gfx906/STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md) · [`STAGE3-LOG.md`](docs/gfx906/STAGE3-LOG.md) · [`STAGE4-LOG.md`](docs/gfx906/STAGE4-LOG.md) · [`STAGE5-7-LOG.md`](docs/gfx906/STAGE5-7-LOG.md) — stage logs
 
 Contributions welcome.
 
