@@ -1,5 +1,9 @@
 #include "ops/linear/w8/w8_dispatch.h"
 
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -18,7 +22,19 @@ constexpr W8Launch kGfx906ReachableW8Launches[] = {
     launch_w8_simt_r8_c8,  // generic (n, k, t)
 };
 
-W8Launch gfx906_reroute(W8Launch launch, std::int32_t t) {
+W8Launch gfx906_reroute(W8Launch launch, std::int32_t k, std::int32_t t) {
+    // Stage-8 tiled route: wave64 LDS-tiled GEMM for multi-token (prefill /
+    // verify) shapes. T=1 stays on the tuned decode whitelist rows; T in
+    // [2,3] stays on the stage-3 SIMT fallback, which still wins there.
+    // Thresholds set by the Tier-1 microbenchmarks in
+    // docs/gfx906/STAGE8-9-LOG.md.
+    if (gfx906_stage8_tiled_enabled() && t >= 4 && k % 4 == 0) {
+        if (launch != launch_w8_decode_r4) {
+            if (t <= 16) { return launch_w8_tiled_c16; }
+            if (t <= 32) { return launch_w8_tiled_c32; }
+            return launch_w8_tiled_c64;
+        }
+    }
     for (const W8Launch safe : kGfx906ReachableW8Launches) {
         if (launch == safe) { return launch; }
     }
@@ -175,7 +191,7 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 #if defined(NINFER_GFX906_COMPAT)
         // Keep the (n, k, t) whitelist as the shape gate, then force the
         // selection onto a gfx906-reachable kernel.
-        return gfx906_reroute(select_w8_a16_launch(n, k, t), t);
+        return gfx906_reroute(select_w8_a16_launch(n, k, t), k, t);
 #else
         return select_w8_a16_launch(n, k, t);
 #endif

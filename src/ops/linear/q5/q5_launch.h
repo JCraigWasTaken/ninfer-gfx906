@@ -15,6 +15,10 @@ void launch_q5_simt_split2_exact(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream);
 void launch_q5_simt_split4_exact(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream);
+// gfx906 stage-8 wave64 LDS-tiled GEMM (multi-token prefill/verify shapes).
+void launch_q5_tiled_c16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q5_tiled_c32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q5_tiled_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q5_mma_r64_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q5_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 

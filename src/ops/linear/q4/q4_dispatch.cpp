@@ -1,5 +1,9 @@
 #include "ops/linear/q4/q4_dispatch.h"
 
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -18,7 +22,19 @@ constexpr Q4Launch kGfx906ReachableQ4Launches[] = {
     launch_q4_simt_r8_c8,         // generic (n, k, t)
 };
 
-Q4Launch gfx906_reroute(Q4Launch launch, std::int32_t t) {
+Q4Launch gfx906_reroute(Q4Launch launch, std::int32_t k, std::int32_t t) {
+    // Stage-8 tiled route: wave64 LDS-tiled GEMM for multi-token (prefill /
+    // verify) shapes. T=1 stays on the tuned GEMV whitelist rows; T in [2,5]
+    // stays on the stage-3 SIMT fallback, which still wins there (the tiled
+    // kernel is latency-flat across T<=16). Thresholds set by the Tier-1
+    // microbenchmarks in docs/gfx906/STAGE8-9-LOG.md.
+    if (gfx906_stage8_tiled_enabled() && t >= 6 && k % 4 == 0) {
+        if (launch != launch_q4_gemv_r1_w8_direct && launch != launch_q4_gemv_r4_w1_direct) {
+            if (t <= 16) { return launch_q4_tiled_c16; }
+            if (t <= 32) { return launch_q4_tiled_c32; }
+            return launch_q4_tiled_c64;
+        }
+    }
     for (const Q4Launch safe : kGfx906ReachableQ4Launches) {
         if (launch == safe) { return launch; }
     }
@@ -121,7 +137,7 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 #if defined(NINFER_GFX906_COMPAT)
         // Keep the (n, k, t) whitelist as the shape gate, then force the
         // selection onto a gfx906-reachable kernel.
-        return gfx906_reroute(select_q4_a16_launch(n, k, t), t);
+        return gfx906_reroute(select_q4_a16_launch(n, k, t), k, t);
 #else
         return select_q4_a16_launch(n, k, t);
 #endif

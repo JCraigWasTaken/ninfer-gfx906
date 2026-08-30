@@ -1,5 +1,9 @@
 #include "ops/linear/q5/q5_dispatch.h"
 
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -20,7 +24,17 @@ constexpr Q5Launch kGfx906ReachableQ5Launches[] = {
     launch_q5_simt_r8_c8,         // generic (n, k, t)
 };
 
-Q5Launch gfx906_reroute(Q5Launch launch, std::int32_t t) {
+Q5Launch gfx906_reroute(Q5Launch launch, std::int32_t k, std::int32_t t) {
+    // Stage-8 tiled route: wave64 LDS-tiled GEMM for multi-token (prefill /
+    // verify) shapes. T=1 stays on the tuned GEMV whitelist rows. Thresholds
+    // set by the Tier-1 microbenchmarks in docs/gfx906/STAGE8-9-LOG.md.
+    if (gfx906_stage8_tiled_enabled() && t >= 2 && k % 4 == 0) {
+        if (launch != launch_q5_gemv_r16_s2_x) {
+            if (t <= 16) { return launch_q5_tiled_c16; }
+            if (t <= 32) { return launch_q5_tiled_c32; }
+            return launch_q5_tiled_c64;
+        }
+    }
     for (const Q5Launch safe : kGfx906ReachableQ5Launches) {
         if (launch == safe) { return launch; }
     }
@@ -107,7 +121,7 @@ Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 #if defined(NINFER_GFX906_COMPAT)
         // Keep the (n, k, t) whitelist as the shape gate, then force the
         // selection onto a gfx906-reachable kernel.
-        return gfx906_reroute(select_q5_a16_launch(n, k, t), t);
+        return gfx906_reroute(select_q5_a16_launch(n, k, t), k, t);
 #else
         return select_q5_a16_launch(n, k, t);
 #endif
