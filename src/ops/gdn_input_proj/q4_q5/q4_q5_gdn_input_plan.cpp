@@ -133,6 +133,17 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
             "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
     }
     if (batch_size > 1) { return {Q4Q5GdnInputConvScheduleId::Materialized}; }
+#if defined(NINFER_GFX906_COMPAT)
+    // Stage-8: the fused projection epilogue's inner GEMMs are the stage-3
+    // fallback kernels, so every multi-token width (MTP verify) now takes
+    // the Materialized route and rides the tiled GEMMs; T=1 decode keeps
+    // the fused epilogue. This is why draft-2 verify (width 3) was 2.4x
+    // slower per round than draft-3 (width 4, already Materialized) before
+    // this reroute — see STAGE8-9-LOG.md.
+    if (gfx906_stage8_tiled_enabled() && problem.cols > 1) {
+        return {Q4Q5GdnInputConvScheduleId::Materialized};
+    }
+#endif
     switch (problem.cols) {
     case 1:
     case 2:
