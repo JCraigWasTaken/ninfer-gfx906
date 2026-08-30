@@ -23,15 +23,16 @@ real-hardware iteration. Details: [`docs/gfx906/PORT-AUDIT.md`](docs/gfx906/PORT
 [`STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md) ·
 [`STAGE3-LOG.md`](docs/gfx906/STAGE3-LOG.md). Contributions welcome.
 
-## What runs on gfx906 (and why "3.6" appears everywhere)
+## Supported model
 
-Inside NInfer, **Qwen3.8-27B is a weights-profile of the code target named
-`qwen3_6_27b`** — the two models share identical geometry, so upstream serves
-both from one engine target (see `src/targets/registry.cpp`). That's why the
-source tree and docs say "qwen3_6" even when running the 3.8 model. On gfx906:
+This port supports one model: the **Qwen3.8-27B `groupwise-int`** artifact
+(~17GB — fits a 32GB card). Other upstream artifacts are not part of this
+port.
 
-Supported on gfx906: the **Qwen3.8-27B `groupwise-int`** artifact (~17GB,
-fits a 32GB card). Other upstream artifacts are not part of this port.
+Naming note: inside NInfer, Qwen3.8-27B is a weights-profile of the code
+target named `qwen3_6_27b` — the two generations share identical geometry, so
+upstream serves both from one engine target (see `src/targets/registry.cpp`).
+That's why the source tree says "qwen3_6" even when running the 3.8 model.
 
 Credits: upstream [Neroued/ninfer](https://github.com/Neroued/ninfer) ·
 the [ninfer-3090](https://github.com/Don-Chad/ninfer-3090) down-port playbook ·
