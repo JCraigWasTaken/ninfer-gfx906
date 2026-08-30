@@ -37,6 +37,8 @@
 #define cudaSuccess hipSuccess
 #define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaErrorInvalidConfiguration hipErrorInvalidConfiguration
+#define cudaErrorNoDevice hipErrorNoDevice
+#define cudaErrorInsufficientDriver hipErrorInsufficientDriver
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
@@ -84,6 +86,7 @@
 #define cudaGraphDestroy hipGraphDestroy
 #define cudaGraphExecDestroy hipGraphExecDestroy
 #define cudaGraphLaunch hipGraphLaunch
+#define cudaGraphGetNodes hipGraphGetNodes
 #define cudaGraphUpload hipGraphUpload
 
 // CUDA-12 flag-style instantiate maps to hipGraphInstantiateWithFlags; the

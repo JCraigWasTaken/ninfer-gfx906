@@ -1012,6 +1012,9 @@ int main() {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;
     }
+#if defined(NINFER_GFX906_COMPAT)
+    std::cout << "SKIP nvfp4/fp8 snapshot capacity checks (unsupported on gfx906)\n";
+#else
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -1044,10 +1047,19 @@ int main() {
         std::cerr << "FP8 snapshot capacity did not preserve measured route witnesses\n";
         ++failures;
     }
+#endif
     failures += run_q4_q5();
     failures += run_w8();
+#if defined(NINFER_GFX906_COMPAT)
+    std::cout << "SKIP run_nvfp4 (unsupported on gfx906)\n";
+#else
     failures += run_nvfp4();
+#endif
+#if defined(NINFER_GFX906_COMPAT)
+    std::cout << "SKIP run_fp8 (unsupported on gfx906)\n";
+#else
     failures += run_fp8();
+#endif
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

@@ -1,3 +1,6 @@
+# gfx906: resolve #include <cuda_runtime.h> and friends to the HIP-mapping shims.
+include_directories(BEFORE ${PROJECT_SOURCE_DIR}/src/compat/gfx906/include)
+
 function(ninfer_add_op_bench name)
   cmake_parse_arguments(arg "" "" "SOURCES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
@@ -8,6 +11,7 @@ function(ninfer_add_op_bench name)
     ${PROJECT_SOURCE_DIR}/src)
   target_link_libraries(${name} PRIVATE ninfer_ops)
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  ninfer_cuda_archive(${name})
 endfunction()
 
 ninfer_add_op_bench(ninfer_silu_mul_bench SOURCES ops/silu_mul_bench.cu)
@@ -71,7 +75,7 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
+target_link_libraries(ninfer_bench PRIVATE ninfer_engine hip::host)
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.

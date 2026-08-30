@@ -497,8 +497,16 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_bf16_target();
+#if defined(NINFER_GFX906_COMPAT)
+    std::cout << "SKIP run_nvfp4_target (unsupported on gfx906)\n";
+#else
     failures += run_nvfp4_target();
+#endif
+#if defined(NINFER_GFX906_COMPAT)
+    std::cout << "SKIP run_fp8_target (unsupported on gfx906)\n";
+#else
     failures += run_fp8_target();
+#endif
     failures += run_w8_target();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
