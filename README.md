@@ -22,6 +22,12 @@ Contributions welcome.
 One model: the **Qwen3.8-27B `groupwise-int`** artifact (~17GB — fits a 32GB
 card). Other upstream artifacts are not part of this port.
 
+Download: [`neroued/Qwen3.8-27B-NInfer`](https://huggingface.co/neroued/Qwen3.8-27B-NInfer)
+→ `qwen3_8_27b.ninfer` (18,210,531,328 bytes,
+sha256 `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e`).
+Build recipe: [`docs/gfx906/STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md); run
+recipe (ROCm container flags, CLI): [`docs/gfx906/STAGE4-LOG.md`](docs/gfx906/STAGE4-LOG.md).
+
 *Naming note:* inside NInfer, Qwen3.8-27B is a weights-profile of the code
 target named `qwen3_6_27b` — the two generations share identical geometry, so
 upstream serves both from one engine target. That's why the source tree says
