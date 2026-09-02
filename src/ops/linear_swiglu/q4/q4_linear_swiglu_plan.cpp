@@ -5,6 +5,10 @@
 #include "core/layout.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -115,6 +119,14 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             "q4 linear_swiglu: exact problem or column count is not admitted");
     }
 
+#if defined(NINFER_GFX906_COMPAT)
+    // Pass 2e: T=2..5 (the MTP verify widths) ride the register-resident pair
+    // GEMV (no gate_up materialisation, no silu_mul, no workspace);
+    // NINFER_GFX906_PASS2_SMALLT=0 keeps the Materialized route.
+    if (problem.cols >= 2 && problem.cols <= 5 && gfx906_pass2_smallt_enabled()) {
+        return Q4LinearSwiGluPlan{Q4LinearSwiGluScheduleId::GemvPair, 0};
+    }
+#endif
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }
         Q4LinearSwiGluPlan plan{

@@ -31,4 +31,17 @@ inline bool gfx906_pass2_gemv_enabled() {
     return enabled;
 }
 
+// Pass-2e route gate for the small-T (2..5) variants of the pass-2 GEMV
+// kernels (the MTP verify shapes). Requires NINFER_GFX906_PASS2 on;
+// NINFER_GFX906_PASS2_SMALLT=0 restores the previous T>1 routes (the stage-8
+// tiled GEMM / Materialized paths) for a separate A/B.
+inline bool gfx906_pass2_smallt_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_GFX906_PASS2_SMALLT");
+        return gfx906_pass2_gemv_enabled() &&
+               !(value != nullptr && value[0] == '0' && value[1] == '\0');
+    }();
+    return enabled;
+}
+
 } // namespace ninfer::ops::detail

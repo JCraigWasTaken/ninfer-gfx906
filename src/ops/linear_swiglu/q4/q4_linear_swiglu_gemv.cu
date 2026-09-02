@@ -225,6 +225,11 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
 #if defined(NINFER_GFX906_COMPAT)
+    // Pass 2e: the plan routes T=2..5 here when the small-T knob is on.
+    if (x.ne[1] != 1) {
+        if (q4_linear_swiglu_gemv_pair_smallt_gfx906_launch(x, w, out, stream)) { return; }
+        throw std::invalid_argument("q4 linear_swiglu GEMV pair: T outside 1..5");
+    }
     // Pass 2: register-resident wave64 pair GEMV (NINFER_GFX906_PASS2=0 reverts).
     if (gfx906_pass2_gemv_enabled()) {
         constexpr int kGrid = kIntermediate / Gfx906GemvGeometry::kRowsPerBlock;
@@ -245,6 +250,62 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
+
+#if defined(NINFER_GFX906_COMPAT)
+// Pass 2e: small-T (2..5) pair GEMV; x [T][K], out [T][kIntermediate].
+// Block geometry per T (screened 2026-09-02, stage10/pass2e-run.log): T=2,3
+// at 512 threads / 32 KB LDS cap (2 blocks/CU, 66-67 VGPRs); T=4,5 at 256
+// threads / 16 KB cap because 73/81 VGPRs allow 3 waves/SIMD, i.e. 3 blocks
+// of 4 waves instead of 1 block of 8 (T=4 308 -> 263 us, T=5 344 -> 310).
+constexpr int kQ4PairSmallTThreadsGfx906   = 512;
+constexpr int kQ4PairSmallTLdsCapGfx906    = 32768;
+constexpr int kQ4PairSmallT45ThreadsGfx906 = 256;
+constexpr int kQ4PairSmallT45LdsCapGfx906  = 16384;
+
+bool q4_linear_swiglu_gemv_pair_smallt_gfx906_launch(const Tensor& x, const Weight& w,
+                                                     Tensor& out, cudaStream_t stream) {
+    const int t = x.ne[1];
+    if (t < 2 || t > 5) { return false; }
+    if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
+        throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
+    }
+    const int x_ld   = static_cast<int>(x.nb[1] / sizeof(__nv_bfloat16));
+    const int out_ld = static_cast<int>(out.nb[1] / sizeof(__nv_bfloat16));
+    const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* qd   = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* sc   = static_cast<const std::uint8_t*>(w.scales);
+    auto* op         = static_cast<__nv_bfloat16*>(out.data);
+    const Q4SwiGluPairEpilogueGfx906 epilogue{};
+    switch (t) {
+    case 2:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kIntermediate, kK, 2, Q4SwiGluPairEpilogueGfx906,
+                                                 kQ4PairSmallTThreadsGfx906,
+                                                 kQ4PairSmallTLdsCapGfx906>(
+            xp, x_ld, qd, sc, op, out_ld, epilogue, stream);
+        break;
+    case 3:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kIntermediate, kK, 3, Q4SwiGluPairEpilogueGfx906,
+                                                 kQ4PairSmallTThreadsGfx906,
+                                                 kQ4PairSmallTLdsCapGfx906>(
+            xp, x_ld, qd, sc, op, out_ld, epilogue, stream);
+        break;
+    case 4:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kIntermediate, kK, 4, Q4SwiGluPairEpilogueGfx906,
+                                                 kQ4PairSmallT45ThreadsGfx906,
+                                                 kQ4PairSmallT45LdsCapGfx906>(
+            xp, x_ld, qd, sc, op, out_ld, epilogue, stream);
+        break;
+    default:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kIntermediate, kK, 5, Q4SwiGluPairEpilogueGfx906,
+                                                 kQ4PairSmallT45ThreadsGfx906,
+                                                 kQ4PairSmallT45LdsCapGfx906>(
+            xp, x_ld, qd, sc, op, out_ld, epilogue, stream);
+        break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif
 
 void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream) {

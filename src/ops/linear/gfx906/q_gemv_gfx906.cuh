@@ -385,4 +385,328 @@ q4_swiglu_pair_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x,
     if (hl == 0) { epilogue(out, row, acc_g, acc_u); }
 }
 
+// ---------------------------------------------------------------------------
+// Pass 2e: small-T (2..5) variants of the two decode GEMV families above.
+//
+// The weight chunk streams are IDENTICAL to T=1 (every weight byte is read
+// exactly once, kDepth 1, same 32-lanes-per-row geometry); what changes:
+//  - x is T vectors staged in LDS as fp16, per K-slab: the slab is sized so
+//    the block's LDS stays <= kLdsCapBytes (32 KB -> 2 blocks/CU at 512
+//    threads = 16 wave64/CU, the pass-2c occupancy lesson). K=5120 at T<=3 is
+//    one slab; K=17408 at T=5 is 6 slabs of 3 steps (2 barriers per slab).
+//  - kT fp32 accumulators per lane (2 kT for the swiglu pair), kT dot2
+//    sequences per decoded chunk, the DPP reduction runs kT times.
+//  - Layout is the one the stage-3 simt / stage-8 tiled routes use: x is
+//    token-major [T][x_ld] bf16, out is [T][out_ld] bf16, the residual is
+//    read from the same (t, row) slot.
+
+template <int kK, int kT, int kLdsCapBytes>
+struct Gfx906SmallTSlab {
+    static constexpr int kSteps         = kK / Gfx906GemvGeometry::kValuesPerStep;
+    static constexpr int kBytesPerStepT = kT * Gfx906GemvGeometry::kValuesPerStep * 2; // fp16
+    static constexpr int kCapSteps      = kLdsCapBytes / kBytesPerStepT;
+    static constexpr int kSlabSteps =
+        kCapSteps < 1 ? 1 : (kCapSteps < kSteps ? kCapSteps : kSteps);
+    static constexpr int kSlabs     = (kSteps + kSlabSteps - 1) / kSlabSteps;
+    static constexpr int kSlabK     = kSlabSteps * Gfx906GemvGeometry::kValuesPerStep;
+    static constexpr int kLdsDwords = kT * kSlabK / 2;
+};
+
+// Stage kT bf16 x rows [k_base, k_base + kSlabK) into LDS as fp16 pairs.
+// Layout is [t][step][v][lane] uint4 (128 uint4 per 1024-value step): lane hl
+// of a half-wave owns values [32 hl, 32 hl + 32) of every step = 4 uint4, and
+// storing its v-th uint4 at step * 128 + v * 32 + hl makes each ds_read_b128
+// wave-wide contiguous (conflict-free) instead of 64 B-strided (banks 0/16
+// only, 16-way conflict). Caller owns the barriers.
+template <int kT, int kSlabK, int kThreads>
+__device__ __forceinline__ void gfx906_stage_x_slab(std::uint32_t* __restrict__ x_sh,
+                                                    const __nv_bfloat16* __restrict__ x, int x_ld,
+                                                    int k_base, int tid) {
+    constexpr int kVecsPerT = kSlabK / 8;
+    auto* x_s               = reinterpret_cast<uint4*>(x_sh);
+#pragma unroll 4
+    for (int i = tid; i < kT * kVecsPerT; i += kThreads) {
+        const int t    = i / kVecsPerT;
+        const int pos  = i - t * kVecsPerT; // swizzled slot within the token slab
+        const int step = pos >> 7;
+        const int v    = (pos >> 5) & 3;
+        const int hl   = pos & 31;
+        const int nat  = step * 128 + hl * 4 + v; // natural uint4 index
+        const uint4 b  = *reinterpret_cast<const uint4*>(
+            x + static_cast<std::int64_t>(t) * x_ld + k_base + nat * 8);
+        uint4 h;
+        h.x    = gfx906_bf16x2_to_half2(b.x);
+        h.y    = gfx906_bf16x2_to_half2(b.y);
+        h.z    = gfx906_bf16x2_to_half2(b.z);
+        h.w    = gfx906_bf16x2_to_half2(b.w);
+        x_s[i] = h;
+    }
+}
+
+template <int kN, int kK, int kT, bool kResidual, int kThreads = 512, int kLdsCapBytes = 32768>
+__global__ void __launch_bounds__(kThreads)
+q5_gemv_smallt_gfx906_kernel(const __nv_bfloat16* __restrict__ x, int x_ld,
+                             const std::uint8_t* __restrict__ codes,
+                             const std::uint8_t* __restrict__ high_bits,
+                             const std::uint8_t* __restrict__ scales,
+                             __nv_bfloat16* __restrict__ out, int out_ld) {
+    using G     = Gfx906GemvGeometry;
+    using Chunk = Q5GemvChunkGfx906;
+    using Slab  = Gfx906SmallTSlab<kK, kT, kLdsCapBytes>;
+    constexpr int kGroups       = kK / Chunk::Storage::kGroupK;
+    constexpr int kSteps        = Slab::kSteps;
+    constexpr int kRowsPerBlock = kThreads / G::kLanesPerRow;
+    static_assert(kT >= 2 && kT <= 8, "small-T kernel covers T=2..8");
+    static_assert(kThreads % 64 == 0 && kThreads >= 64 && kThreads <= 1024, "1..16 wave64 per block");
+    static_assert(kK % G::kValuesPerStep == 0, "K must be a multiple of 1024");
+    static_assert(kN % kRowsPerBlock == 0, "N must be a multiple of the rows per block");
+
+    __shared__ __align__(16) std::uint32_t x_sh[Slab::kLdsDwords];
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int wave   = tid >> 6;
+    const int lane64 = tid & 63;
+    const int half   = lane64 >> 5;
+    const int hl     = lane64 & 31;
+    const int row    = static_cast<int>(blockIdx.x) * kRowsPerBlock + wave * G::kRowsPerWave + half;
+
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kCodeBytesPerGroup;
+    const std::uint8_t* high_row =
+        high_bits + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kHighBytesPerGroup;
+    const std::uint8_t* scale_row =
+        scales + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kScaleBytesPerGroup;
+
+    // First chunk in flight before the first x staging barrier (kDepth 1).
+    typename Chunk::Raw raw = Chunk::load(code_row, high_row, scale_row, 0, hl);
+
+    float acc[kT];
+#pragma unroll
+    for (int t = 0; t < kT; ++t) { acc[t] = 0.0f; }
+
+#pragma unroll
+    for (int slab = 0; slab < Slab::kSlabs; ++slab) {
+        if (slab > 0) { __syncthreads(); } // previous slab's LDS reads retired
+        gfx906_stage_x_slab<kT, Slab::kSlabK, kThreads>(x_sh, x, x_ld, slab * Slab::kSlabK, tid);
+        __syncthreads();
+#pragma unroll
+        for (int ss = 0; ss < Slab::kSlabSteps; ++ss) {
+            const int s = slab * Slab::kSlabSteps + ss;
+            if (s < kSteps) {
+                const typename Chunk::Raw cur = raw;
+                if (s + 1 < kSteps) { raw = Chunk::load(code_row, high_row, scale_row, s + 1, hl); }
+                std::uint32_t w[16];
+                Chunk::decode(cur, w);
+                // fp16 x pairs for values [32 hl, 32 hl + 32) of slab-step ss: swizzled
+                // slots ss * 128 + v * 32 + hl (see gfx906_stage_x_slab).
+#pragma unroll
+                for (int t = 0; t < kT; ++t) {
+                    const uint4* x_s4 = reinterpret_cast<const uint4*>(x_sh) +
+                                        t * (Slab::kSlabK / 8) + ss * 128 + hl;
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        const uint4 xv = x_s4[v * 32];
+                        acc[t]         = gfx906_fdot2(w[4 * v + 0], xv.x, acc[t]);
+                        acc[t]         = gfx906_fdot2(w[4 * v + 1], xv.y, acc[t]);
+                        acc[t]         = gfx906_fdot2(w[4 * v + 2], xv.z, acc[t]);
+                        acc[t]         = gfx906_fdot2(w[4 * v + 3], xv.w, acc[t]);
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < kT; ++t) {
+        const float r = gfx906_reduce_sum32(acc[t]);
+        if (hl == 0) {
+            __nv_bfloat16* o = out + static_cast<std::int64_t>(t) * out_ld + row;
+            float v          = r;
+            if constexpr (kResidual) { v = __bfloat162float(*o) + v; }
+            *o = __float2bfloat16_rn(v);
+        }
+    }
+}
+
+template <int kN, int kK, int kT, bool kResidual, int kThreads = 512, int kLdsCapBytes = 32768>
+inline void q5_gemv_smallt_gfx906_launch(const __nv_bfloat16* x, int x_ld, const std::uint8_t* codes,
+                                         const std::uint8_t* high_bits, const std::uint8_t* scales,
+                                         __nv_bfloat16* out, int out_ld, cudaStream_t stream) {
+    constexpr int kGrid = kN / (kThreads / Gfx906GemvGeometry::kLanesPerRow);
+    q5_gemv_smallt_gfx906_kernel<kN, kK, kT, kResidual, kThreads, kLdsCapBytes>
+        <<<kGrid, kThreads, 0, stream>>>(x, x_ld, codes, high_bits, scales, out, out_ld);
+}
+
+// Runtime T -> instantiation (T=2..5). Returns false when T is outside the
+// small-T domain so the caller keeps its existing route.
+template <int kN, int kK, bool kResidual, int kThreads = 512, int kLdsCapBytes = 32768>
+inline bool q5_gemv_smallt_gfx906_dispatch(int t, const __nv_bfloat16* x, int x_ld,
+                                           const std::uint8_t* codes, const std::uint8_t* high_bits,
+                                           const std::uint8_t* scales, __nv_bfloat16* out,
+                                           int out_ld, cudaStream_t stream) {
+    switch (t) {
+    case 2:
+        q5_gemv_smallt_gfx906_launch<kN, kK, 2, kResidual, kThreads, kLdsCapBytes>(
+            x, x_ld, codes, high_bits, scales, out, out_ld, stream);
+        return true;
+    case 3:
+        q5_gemv_smallt_gfx906_launch<kN, kK, 3, kResidual, kThreads, kLdsCapBytes>(
+            x, x_ld, codes, high_bits, scales, out, out_ld, stream);
+        return true;
+    case 4:
+        q5_gemv_smallt_gfx906_launch<kN, kK, 4, kResidual, kThreads, kLdsCapBytes>(
+            x, x_ld, codes, high_bits, scales, out, out_ld, stream);
+        return true;
+    case 5:
+        q5_gemv_smallt_gfx906_launch<kN, kK, 5, kResidual, kThreads, kLdsCapBytes>(
+            x, x_ld, codes, high_bits, scales, out, out_ld, stream);
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Q4 swiglu gate/up pair, small T. Epilogue contract: epilogue(out_t, row,
+// gate, up) from half-lane 0 with out_t = out + t * out_ld.
+template <int kIntermediate, int kK, int kT, class Epilogue, int kThreads = 512,
+          int kLdsCapBytes = 32768>
+__global__ void __launch_bounds__(kThreads)
+q4_swiglu_pair_gemv_smallt_gfx906_kernel(const __nv_bfloat16* __restrict__ x, int x_ld,
+                                         const std::uint8_t* __restrict__ codes,
+                                         const std::uint8_t* __restrict__ scales,
+                                         __nv_bfloat16* __restrict__ out, int out_ld,
+                                         Epilogue epilogue) {
+    using G     = Gfx906GemvGeometry;
+    using Chunk = Q4GemvChunkGfx906;
+    using Slab  = Gfx906SmallTSlab<kK, kT, kLdsCapBytes>;
+    constexpr int kGroups       = kK / Chunk::Storage::kGroupK;
+    constexpr int kSteps        = Slab::kSteps;
+    constexpr int kRowsPerBlock = kThreads / G::kLanesPerRow;
+    static_assert(kT >= 2 && kT <= 8, "small-T kernel covers T=2..8");
+    static_assert(kK % G::kValuesPerStep == 0, "K must be a multiple of 1024");
+    static_assert(kIntermediate % kRowsPerBlock == 0, "N/2 must be a multiple of the rows per block");
+
+    __shared__ __align__(16) std::uint32_t x_sh[Slab::kLdsDwords];
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int wave   = tid >> 6;
+    const int lane64 = tid & 63;
+    const int half   = lane64 >> 5;
+    const int hl     = lane64 & 31;
+    const int row    = static_cast<int>(blockIdx.x) * kRowsPerBlock + wave * G::kRowsPerWave + half;
+
+    const std::uint8_t* gate_code_row =
+        codes + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kCodeBytesPerGroup;
+    const std::uint8_t* gate_scale_row =
+        scales + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kScaleBytesPerGroup;
+    const std::uint8_t* up_code_row =
+        codes + static_cast<std::int64_t>(row + kIntermediate) * kGroups *
+                    Chunk::Storage::kCodeBytesPerGroup;
+    const std::uint8_t* up_scale_row =
+        scales + static_cast<std::int64_t>(row + kIntermediate) * kGroups *
+                     Chunk::Storage::kScaleBytesPerGroup;
+
+    typename Chunk::Raw raw_g = Chunk::load(gate_code_row, gate_scale_row, 0, hl);
+    typename Chunk::Raw raw_u = Chunk::load(up_code_row, up_scale_row, 0, hl);
+
+    float acc_g[kT];
+    float acc_u[kT];
+#pragma unroll
+    for (int t = 0; t < kT; ++t) {
+        acc_g[t] = 0.0f;
+        acc_u[t] = 0.0f;
+    }
+
+#pragma unroll
+    for (int slab = 0; slab < Slab::kSlabs; ++slab) {
+        if (slab > 0) { __syncthreads(); }
+        gfx906_stage_x_slab<kT, Slab::kSlabK, kThreads>(x_sh, x, x_ld, slab * Slab::kSlabK, tid);
+        __syncthreads();
+#pragma unroll
+        for (int ss = 0; ss < Slab::kSlabSteps; ++ss) {
+            const int s = slab * Slab::kSlabSteps + ss;
+            if (s < kSteps) {
+                const typename Chunk::Raw cur_g = raw_g;
+                const typename Chunk::Raw cur_u = raw_u;
+                if (s + 1 < kSteps) {
+                    raw_g = Chunk::load(gate_code_row, gate_scale_row, s + 1, hl);
+                    raw_u = Chunk::load(up_code_row, up_scale_row, s + 1, hl);
+                }
+                std::uint32_t wg[16];
+                std::uint32_t wu[16];
+                Chunk::decode(cur_g, wg);
+                Chunk::decode(cur_u, wu);
+#pragma unroll
+                for (int t = 0; t < kT; ++t) {
+                    const uint4* x_s4 = reinterpret_cast<const uint4*>(x_sh) +
+                                        t * (Slab::kSlabK / 8) + ss * 128 + hl;
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        const uint4 xv = x_s4[v * 32];
+                        acc_g[t]       = gfx906_fdot2(wg[4 * v + 0], xv.x, acc_g[t]);
+                        acc_u[t]       = gfx906_fdot2(wu[4 * v + 0], xv.x, acc_u[t]);
+                        acc_g[t]       = gfx906_fdot2(wg[4 * v + 1], xv.y, acc_g[t]);
+                        acc_u[t]       = gfx906_fdot2(wu[4 * v + 1], xv.y, acc_u[t]);
+                        acc_g[t]       = gfx906_fdot2(wg[4 * v + 2], xv.z, acc_g[t]);
+                        acc_u[t]       = gfx906_fdot2(wu[4 * v + 2], xv.z, acc_u[t]);
+                        acc_g[t]       = gfx906_fdot2(wg[4 * v + 3], xv.w, acc_g[t]);
+                        acc_u[t]       = gfx906_fdot2(wu[4 * v + 3], xv.w, acc_u[t]);
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < kT; ++t) {
+        const float g = gfx906_reduce_sum32(acc_g[t]);
+        const float u = gfx906_reduce_sum32(acc_u[t]);
+        if (hl == 0) { epilogue(out + static_cast<std::int64_t>(t) * out_ld, row, g, u); }
+    }
+}
+
+template <int kIntermediate, int kK, int kT, class Epilogue, int kThreads = 512,
+          int kLdsCapBytes = 32768>
+inline void q4_swiglu_pair_gemv_smallt_gfx906_launch(const __nv_bfloat16* x, int x_ld,
+                                                     const std::uint8_t* codes,
+                                                     const std::uint8_t* scales,
+                                                     __nv_bfloat16* out, int out_ld,
+                                                     Epilogue epilogue, cudaStream_t stream) {
+    constexpr int kGrid = kIntermediate / (kThreads / Gfx906GemvGeometry::kLanesPerRow);
+    q4_swiglu_pair_gemv_smallt_gfx906_kernel<kIntermediate, kK, kT, Epilogue, kThreads, kLdsCapBytes>
+        <<<kGrid, kThreads, 0, stream>>>(x, x_ld, codes, scales, out, out_ld, epilogue);
+}
+
+template <int kIntermediate, int kK, class Epilogue, int kThreads = 512, int kLdsCapBytes = 32768>
+inline bool q4_swiglu_pair_gemv_smallt_gfx906_dispatch(int t, const __nv_bfloat16* x, int x_ld,
+                                                       const std::uint8_t* codes,
+                                                       const std::uint8_t* scales,
+                                                       __nv_bfloat16* out, int out_ld,
+                                                       Epilogue epilogue, cudaStream_t stream) {
+    switch (t) {
+    case 2:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kIntermediate, kK, 2, Epilogue, kThreads,
+                                                 kLdsCapBytes>(x, x_ld, codes, scales, out, out_ld,
+                                                               epilogue, stream);
+        return true;
+    case 3:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kIntermediate, kK, 3, Epilogue, kThreads,
+                                                 kLdsCapBytes>(x, x_ld, codes, scales, out, out_ld,
+                                                               epilogue, stream);
+        return true;
+    case 4:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kIntermediate, kK, 4, Epilogue, kThreads,
+                                                 kLdsCapBytes>(x, x_ld, codes, scales, out, out_ld,
+                                                               epilogue, stream);
+        return true;
+    case 5:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kIntermediate, kK, 5, Epilogue, kThreads,
+                                                 kLdsCapBytes>(x, x_ld, codes, scales, out, out_ld,
+                                                               epilogue, stream);
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace ninfer::ops::detail
