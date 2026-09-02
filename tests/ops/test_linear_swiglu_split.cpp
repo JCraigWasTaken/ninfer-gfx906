@@ -44,6 +44,7 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/gfx906_compat.h"
 
 #include "core/device.h"
 
@@ -695,8 +696,10 @@ int verify_registry() {
     constexpr auto kA4  = ops::LinearPolicy::AllowA4;
     constexpr auto kA8  = ops::LinearPolicy::AllowA8;
 
+    const bool run_fp8   = !gfx906::skip(QType::FP8_E4M3FN_ROW_BF16S, "linear_swiglu registry");
+    const bool run_nvfp4 = !gfx906::skip(QType::NVFP4, "linear_swiglu registry");
     for (const std::int32_t tokens : {1, 2, 16, 48, 1024}) {
-        try {
+        if (run_fp8) try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
                 QType::FP8_E4M3FN_ROW_BF16S, kA16, tokens, tokens);
         } catch (const std::exception& error) {
@@ -704,7 +707,7 @@ int verify_registry() {
                       << '\n';
             ++failures;
         }
-        try {
+        if (run_fp8) try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(
                 QType::FP8_E4M3FN_ROW_BF16S, kA8, tokens, tokens);
         } catch (const std::exception& error) {
@@ -712,7 +715,7 @@ int verify_registry() {
                       << '\n';
             ++failures;
         }
-        try {
+        if (run_nvfp4) try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::NVFP4, kA16,
                                                                               tokens, tokens);
         } catch (const std::exception& error) {
@@ -721,7 +724,7 @@ int verify_registry() {
                       << '\n';
             ++failures;
         }
-        try {
+        if (run_nvfp4) try {
             (void)ops::linear_swiglu_column_parallel_workspace_capacity_bytes(QType::NVFP4, kA4,
                                                                               tokens, tokens);
         } catch (const std::exception& error) {
@@ -917,7 +920,10 @@ int main() {
         {"fp8 gate_up", QType::FP8_E4M3FN_ROW_BF16S, 38u, {1, 2, 3, 4, 5, 48, 128, 1024},
          {kA16, kA8}},
     };
-    for (const Case& test_case : cases) { failures += run_case(test_case, ec); }
+    for (const Case& test_case : cases) {
+        if (gfx906::skip(test_case.qtype, test_case.label)) { continue; }
+        failures += run_case(test_case, ec);
+    }
 
     const std::vector<PipelineCase> pipeline_cases{
         {"nvfp4+nvfp4", QType::NVFP4, QType::NVFP4, 41u, 8, kA4},
@@ -933,6 +939,10 @@ int main() {
          kA16},
     };
     for (const PipelineCase& test_case : pipeline_cases) {
+        if (gfx906::skip(test_case.gate_up_qtype, test_case.label) ||
+            gfx906::skip(test_case.down_qtype, test_case.label)) {
+            continue;
+        }
         failures += run_pipeline_case(test_case, ec, events);
     }
 

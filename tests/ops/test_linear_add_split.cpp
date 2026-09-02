@@ -33,6 +33,7 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/gfx906_compat.h"
 
 #include "core/device.h"
 
@@ -465,6 +466,9 @@ int verify_registry() {
 
     int failures = 0;
     for (const Entry& entry : entries) {
+        if (gfx906::skip(entry.qtype, "linear_add shard registry", /*bf16_linear_shard=*/true)) {
+            continue;
+        }
         for (const std::int32_t tokens : {1, 2, 48, 1024}) {
             try {
                 (void)ops::linear_add_workspace_capacity_bytes(entry.qtype, entry.n, entry.k,
@@ -648,7 +652,13 @@ int main() {
          {1, 8, 24, 25, 48, 128, 1024}, {kA16, kA8}},
     };
 
-    for (const Case& test_case : cases) { failures += run_case(test_case, ec, events); }
+    for (const Case& test_case : cases) {
+        // bf16 o_proj: the plain rank issues through ops::linear's bf16 tp2 shard.
+        if (gfx906::skip(test_case.qtype, test_case.label, /*bf16_linear_shard=*/true)) {
+            continue;
+        }
+        failures += run_case(test_case, ec, events);
+    }
 
     std::cout << (failures ? "FAIL" : "OK") << " linear_add split\n";
     return failures ? 1 : 0;

@@ -70,6 +70,7 @@
 #include "ops/gqa_attention_fixture.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/gfx906_compat.h"
 
 #include <algorithm>
 #include <array>
@@ -2118,7 +2119,10 @@ int run_leg_c(const ExecutionContext& ec) {
         {"q4/q5 gdn conv", QType::Q4G64_F16S, ops::LinearPolicy::A16Only, 1, 4, false},
         {"q4/q5 gdn conv", QType::Q4G64_F16S, ops::LinearPolicy::A16Only, 2, 3, true},
     };
-    for (const ConvCase& test_case : cases) { failures += run_conv_case(ec, test_case); }
+    for (const ConvCase& test_case : cases) {
+        if (gfx906::skip(test_case.qtype, test_case.label)) { continue; }
+        failures += run_conv_case(ec, test_case);
+    }
     return failures;
 }
 
@@ -2401,6 +2405,7 @@ int verify_registry() {
     // The conv snapshot/record split capacity queries must admit every registered shard format and
     // reject the ones that are deliberately not registered (W8 is the 35B-A3B parent).
     for (const QType qtype : {QType::NVFP4, QType::FP8_E4M3FN_ROW_BF16S, QType::Q4G64_F16S}) {
+        if (gfx906::skip(qtype, "gdn conv shard registry")) { continue; }
         try {
             (void)ops::gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
                 qtype, ops::LinearPolicy::A16Only, 2, 1, 16);

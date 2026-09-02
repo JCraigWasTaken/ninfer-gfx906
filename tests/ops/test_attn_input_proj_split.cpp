@@ -38,6 +38,7 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/gfx906_compat.h"
 
 #include "core/device.h"
 
@@ -716,6 +717,7 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
 // ---------------------------------------------------------------------------------------------
 int verify_registry() {
     int failures = 0;
+    if (!gfx906::skip(QType::NVFP4, "attn_input_proj column-parallel registry"))
     for (const ops::LinearPolicy policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}) {
         for (const std::int32_t tokens : {1, 2, 48, 1024}) {
             try {
@@ -729,6 +731,7 @@ int verify_registry() {
         }
     }
     // FP8's fused column-parallel shard.
+    if (!gfx906::skip(QType::FP8_E4M3FN_ROW_BF16S, "attn_input_proj column-parallel registry"))
     for (const ops::LinearPolicy policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
         for (const std::int32_t tokens : {1, 2, 48, 1024}) {
             try {
@@ -890,6 +893,7 @@ int main() {
     // T sweep: T=1 (decode edge), small-T/MMA frontiers, T=128 (W4A4 MMA under AllowA4), T=1024 (a
     // multiple of 256 -- the sole route into the NVFP4 W4A4 TMA kernel, exercised on the shard
     // TMA descriptor as well as the tp1 one).
+    if (!gfx906::skip(QType::NVFP4, "nvfp4 attn_input fused"))
     failures += run_fused_case(ec, QType::NVFP4, 41u, "nvfp4 attn_input fused",
                                {1, 2, 5, 8, 17, 32, 48, 128, 1024},
                                {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4});
@@ -897,6 +901,7 @@ int main() {
     // Geometry-templated, same as NVFP4 -- see attn_input_proj.h's design note). T sweep: 1 the
     // decode edge; 2/8/10 small-T (kFp8LinearSmallTMax<AttnInput>=11); 11 the AllowA8 route's own
     // A8 crossover; 32/48/128/1024 beyond it.
+    if (!gfx906::skip(QType::FP8_E4M3FN_ROW_BF16S, "fp8 attn_input fused"))
     failures += run_fused_case(ec, QType::FP8_E4M3FN_ROW_BF16S, 46u, "fp8 attn_input fused",
                                {1, 2, 8, 10, 11, 32, 48, 128, 1024},
                                {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8});

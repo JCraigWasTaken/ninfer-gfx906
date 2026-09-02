@@ -252,7 +252,8 @@ ninfer_add_op_test(ninfer_sparse_moe_test
 ninfer_add_op_test(ninfer_allreduce_test
   SOURCES ops/test_allreduce.cpp
   LIBRARIES ninfer_ops)
-# TP2 split forms (two devices; skip 77 on one). test_mtp_split / test_gdn_headsplit wait on S4.
+# TP2 split forms (two devices; skip 77 on one). NVFP4/FP8 rows are skipped on gfx906 by
+# tests/ops/gfx906_compat.h; test_mtp_split / test_gdn_headsplit build (S3b) but may still wait on S4.
 ninfer_add_op_test(ninfer_linear_split_test
   SOURCES ops/test_linear_split.cpp
   LIBRARIES ninfer_ops)
@@ -270,6 +271,12 @@ ninfer_add_op_test(ninfer_gdn_projections_split_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_output_head_split_test
   SOURCES ops/test_output_head_split.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_mtp_split_test
+  SOURCES ops/test_mtp_split.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_headsplit_test
+  SOURCES ops/test_gdn_headsplit.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp

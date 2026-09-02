@@ -69,6 +69,7 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/gfx906_compat.h"
 
 #include "core/device.h"
 
@@ -579,6 +580,7 @@ int verify_registry() {
     };
     int failures = 0;
     for (const Entry& entry : entries) {
+        if (gfx906::skip(entry.qtype, "vocabulary shard registry")) { continue; }
         for (const std::int32_t tokens : {1, 2, 48, 1024}) {
             try {
                 (void)ops::linear_workspace_capacity_bytes(entry.qtype, kHalf, kHidden,
@@ -658,7 +660,10 @@ int main() {
         {"q6 output_head", QType::Q6G64_F16S, 303u, {1, 4, 16, 24, 32, 48}, {kA16}},
     };
 
-    for (const HeadCase& test_case : cases) { failures += run_head_case(test_case, ec, events); }
+    for (const HeadCase& test_case : cases) {
+        if (gfx906::skip(test_case.qtype, test_case.label)) { continue; }
+        failures += run_head_case(test_case, ec, events);
+    }
 
     std::cout << (failures ? "FAIL" : "OK") << " output head split\n";
     return failures ? 1 : 0;

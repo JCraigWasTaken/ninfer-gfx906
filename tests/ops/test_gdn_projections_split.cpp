@@ -47,6 +47,7 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/gfx906_compat.h"
 
 #include "core/device.h"
 
@@ -1096,6 +1097,7 @@ int run_gating_fused_case(const ExecutionContext& ec, std::uint32_t seed, std::i
 int verify_registry() {
     int failures = 0;
     for (const QType qtype : {QType::NVFP4, QType::FP8_E4M3FN_ROW_BF16S}) {
+        if (gfx906::skip(qtype, "gdn_input column-parallel registry")) { continue; }
         const std::vector<ops::LinearPolicy> policies =
             qtype == QType::NVFP4
                 ? std::vector<ops::LinearPolicy>{ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}
@@ -1246,8 +1248,10 @@ int main() {
               << '\n';
 
     failures += verify_split_rejections(ec);
+    if (!gfx906::skip(QType::NVFP4, "nvfp4 gdn_input fused"))
     failures += run_fused_case(
         ec, QType::NVFP4, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}, 41u);
+    if (!gfx906::skip(QType::FP8_E4M3FN_ROW_BF16S, "fp8 gdn_input fused"))
     failures += run_fused_case(
         ec, QType::FP8_E4M3FN_ROW_BF16S, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8},
         45u);
