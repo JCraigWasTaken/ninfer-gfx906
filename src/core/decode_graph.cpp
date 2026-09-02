@@ -35,9 +35,12 @@
 
 #include "core/device.h"
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer {
 namespace {
@@ -296,11 +299,39 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
     return *this;
 }
 
+// NINFER_GFX906_GRAPH_TRACE=1: print the node histogram at instantiate and, for the first launches,
+// the host cost of hipGraphLaunch separately from the wait for the device (S8 diagnosis aid).
+static bool graph_trace_enabled() {
+    static const bool on = std::getenv("NINFER_GFX906_GRAPH_TRACE") != nullptr;
+    return on;
+}
+
+static void trace_histogram(cudaGraph_t graph) {
+    std::size_t count = 0;
+    if (cudaGraphGetNodes(graph, nullptr, &count) != cudaSuccess) { return; }
+    std::vector<cudaGraphNode_t> nodes(count);
+    if (count != 0 && cudaGraphGetNodes(graph, nodes.data(), &count) != cudaSuccess) { return; }
+    int kernel = 0, memcpy_n = 0, memset_n = 0, other = 0;
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        if (cudaGraphNodeGetType(node, &type) != cudaSuccess) { continue; }
+        if (type == cudaGraphNodeTypeKernel) { ++kernel; }
+        else if (type == cudaGraphNodeTypeMemcpy) { ++memcpy_n; }
+        else if (type == hipGraphNodeTypeMemset) { ++memset_n; }
+        else { ++other; }
+    }
+    std::size_t edges = 0;
+    (void)hipGraphGetEdges(graph, nullptr, nullptr, &edges);
+    std::fprintf(stderr, "[graph-trace] instantiate: %zu nodes (kernel %d memcpy %d memset %d other %d), %zu edges\n",
+                 count, kernel, memcpy_n, memset_n, other, edges);
+}
+
 void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition) {
     if (!definition.ready()) {
         throw std::logic_error("cannot instantiate an empty CUDA Graph definition");
     }
     reset();
+    if (graph_trace_enabled()) { trace_histogram(definition.graph_); }
 
     cudaGraphExec_t exec  = nullptr;
     const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
@@ -332,6 +363,22 @@ void DecodeGraphExecutable::upload(cudaStream_t stream) {
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {
     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
+    if (graph_trace_enabled()) {
+        static int traced = 0;
+        if (traced < 12) {
+            ++traced;
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+            const auto t1 = clock::now();
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const auto t2 = clock::now();
+            std::fprintf(stderr, "[graph-trace] launch %d: hipGraphLaunch %.3f ms, sync after %.3f ms\n", traced,
+                         std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                         std::chrono::duration<double, std::milli>(t2 - t1).count());
+            return;
+        }
+    }
     CUDA_CHECK(cudaGraphLaunch(exec_, stream));
 }
 
