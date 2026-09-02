@@ -114,7 +114,14 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     return *this;
 }
 
-int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; }
+int DeviceContext::compute_capability() const noexcept { return props.major * 10 + props.minor; }
+
+// On HIP this is hipDeviceProp_t::multiProcessorCount = the compute-unit count (60 on gfx906).
+int DeviceContext::multiprocessor_count() const noexcept { return props.multiProcessorCount; }
+
+DeviceExecutionView DeviceContext::execution_view() const noexcept {
+    return {.stream = stream, .multiprocessor_count = multiprocessor_count()};
+}
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 
