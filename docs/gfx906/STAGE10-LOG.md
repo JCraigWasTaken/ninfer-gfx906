@@ -95,3 +95,18 @@ MTP x1.05 (prose, this model at draft 2) to x1.8 (code, draft 3, measured); 2 ca
 - Stale untracked draft `src/ops/linear/rowsplit_gemm_tiled_gfx906.cuh` on the laptop clone: unreferenced, deleted.
 - Harness notes: `ninfer_bench` needs `--corpus` (or the repo as cwd) and `--profile-measured` needs one test with
   `-r 1`; rocprofv3 needs `libdw1` in the container; `ninfer-serve --kv-capacity auto` sized 120K tokens at 8.85 GiB.
+
+## 4. Pass 1 results (2026-09-02, five upstream cherry-picks, all kept)
+
+| pick | commit | gate results | tg128 | pp512 | note |
+|---|---|---|---|---|---|
+| 9954867a rmsnorm weight hoist | 06f2a173 | rmsnorm + gated_rmsnorm OK | 12.74 | 211.7 | prefetch-blocks literal 170 -> 60 CUs under compat |
+| 02bd904e MTP prefill token on device | f00471c3 | greedy MTP identical | 12.74 | 211.7 | one textual conflict (timing hooks) |
+| e51b585c GDN cooperative-launch capacity | d19adf37 | gdn_gating_proj OK (first build on this tree) | 12.76 | 210.6 | cooperative path unreached on gfx906 (route tables); CU count from occupancy API |
+| 92bb06eb GDN prefill conv direct q/k/v | 52e3c864 | conv1d_silu + gdn_input_proj OK; greedy identical | 12.67 | 210.5 / 197.3 @2048 | predicted +1-3 % prefill did NOT appear; workspace peak unchanged |
+| 21a0e85f fp16 V storage + PV | 35a9c5aa | gqa_attention + kv_cache_append OK (first build); greedy identical; probe v3 30K 7/7 | 12.61 (hot) | 209.1 | port SIMT attention kernels now consume fp16 V; 22 files |
+
+Verdict: hygiene, not speed — exactly what the batch-E profile said would happen. Decode stays in the 12.6-12.8
+band; prefill within noise. The port is now current with upstream on the portable runtime and kernel changes and
+three gate tests build for the first time. Pass 2 (T=1 GEMV retune) is the speed lever; its design brief is
+docs/gfx906/PASS2-DESIGN.md.
