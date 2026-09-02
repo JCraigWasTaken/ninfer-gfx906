@@ -5,14 +5,13 @@ the first AMD target in the NInfer ecosystem.
 
 ## Status
 
-**Stages 1-8 complete; stage 10 (retune) in progress on a cooled MI50.**
-Baseline on card 2 after cooling (2026-09-02): plain decode 12.7 tok/s, MTP code
-draft-3 22.9 tok/s, prefill 212 tok/s at 512 tokens, deep-context tool-call
-probe 7/7 at 30.9K tokens with output identical to llama.cpp. The rocprof
-trace shows decode is kernel-bound: four T=1 GEMV kernels take 66 of 79 ms per
-token at a quarter of the available bandwidth, so the GEMV retune is the next
-lever, then prefill attention (quadratic past ~30K). Plan, numbers, and
-predictions: docs/gfx906/STAGE10-LOG.md.
+**Stage 10 in progress; tensor-parallel (2x MI50) working.** Single card after the
+T=1/small-T GEMV retune (2026-09-02): plain decode 23.6 tok/s, MTP code 36.7, prose 22.2.
+Two cards (--tp 2, eager; graph replay across devices is pathological on ROCm 6.4.1):
+plain 31.9 tok/s, prefill 340 tok/s at 512 tokens, MTP code 37.3, prose 25.2; the donor
+parity gate passes with ~10x margin and the 30K-token tool-call probe is 7/7 with output
+identical to llama.cpp. Plan, numbers and predictions: docs/gfx906/STAGE10-LOG.md,
+docs/gfx906/TP2-SLICES.md.
 
 - [`docs/gfx906/PORT-AUDIT.md`](docs/gfx906/PORT-AUDIT.md) — kernel census, port order, donor map
 - [`docs/gfx906/STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md) · [`STAGE3-LOG.md`](docs/gfx906/STAGE3-LOG.md) · [`STAGE4-LOG.md`](docs/gfx906/STAGE4-LOG.md) · [`STAGE5-7-LOG.md`](docs/gfx906/STAGE5-7-LOG.md) · [`STAGE8-9-LOG.md`](docs/gfx906/STAGE8-9-LOG.md) — stage logs

@@ -166,3 +166,25 @@ predicted); byte-identical; kept for one layout. tg128 23.55.
 
 Single-card standing at the end of pass 2 (card 2, groupwise-int, bf16-K/fp16-V KV): plain 23.55, MTP code d3
 36.2-36.7, MTP prose d2 22.1-22.2, pp512 211, probe v3 30K 7/7. Day start: 12.66 / 22.9 / 13.2.
+
+## 7. TP2 (2026-09-02): the donor tensor-parallel port, seven slices, one afternoon
+
+Plan: docs/gfx906/TP2-SLICES.md. Every slice kept tp=1 byte-identical (p3 plain and p4 MTP greedy md5s), and
+production was restored after each two-card batch. Wall clock per slice: 9 / 9 / 18+47+6 / 15 / 18 / 60 / 23 min.
+
+| slice | what | gate result |
+|---|---|---|
+| 1 | allreduce transport, ExecutionContext, 9 HIP shim macros, donor probes | capture_probe: one hipGraph spans both MI50s on ROCm 6.4.1 (replay == eager); 10 KiB all-reduce 46 us; P2P both ways |
+| 2 | shard map, storage slices, binder, 27B binding plan | host planner splits our artifact 9181 / 9181 MiB |
+| 3, 3b, 3c | split forms for every op; test filter for gfx906; the two split-storage faults (tp1 row constants in the fused tiled launchers) fixed | all six groupwise split suites PASS on two cards |
+| 4 | 12/2 head-local attention geometry, decode-graph peer bridge, per-device KV capacity | headlocal parity OK, mtp_split + gdn_headsplit OK |
+| 5 | rank-aware runtime, engine execution devices, --tp/--devices; YaRN stripped | tp1 identical, serve answers, --tp 2 refuses cleanly on one card |
+| 6 | first two-card run, donor parity test, serve probe | eager tp2 greedy = tp1 byte for byte; parity PASS (KL 0.00045 vs 0.0018 budget, argmax 99.4 %); probe 30K 7/7 same hash; 1.75x faster end to end; but plain 13.44 (shard shapes on tiled kernels) and captured-graph replay across two devices 0.21 t/s |
+| 7 | pass-2 GEMVs for the shard shapes (K-tail at 8704; gate_up shard = pair kernel at 8704; gdn/attn T=1 split-store) | tp2 eager plain 31.93 (1.35x tp1), pp512 340; MTP code 37.3 flat, prose 25.2 |
+
+Findings that shape the next steps: (a) multi-device graph REPLAY is pathological on this ROCm (capture and
+instantiate are fine) so tp2 runs eager at a measured ~7 % cost; (b) tp2 MTP did not move when the verify kernels
+got 2-3x faster, so the draft path (W8 MTP-layer shards + the split draft head) is the tp2 MTP bottleneck;
+(c) RCCL 2.30 as shipped cannot complete a 2-card collective on this host at all (its own rccl-tests fail at the
+first AllReduce, iommu=pt ruled out) — reported on mx-llama.cpp issue #7 — so an RCCL-backed exchange is blocked;
+(d) the exchange is bounded at <= 5.9 ms/token and is not yet the limiter.
