@@ -207,7 +207,7 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 #if defined(NINFER_GFX906_COMPAT)
 // Pass 2 (gfx906): register-resident pair GEMV, q_gemv_gfx906.cuh. Ring depth
 // screened 1/2/3 (stage10/pass2b-depth.sh).
-constexpr int kQ4PairDepthGfx906 = 2;
+constexpr int kQ4PairDepthGfx906 = 1;
 
 struct Q4SwiGluPairEpilogueGfx906 {
     __device__ __forceinline__ void operator()(__nv_bfloat16* __restrict__ out, int row,
