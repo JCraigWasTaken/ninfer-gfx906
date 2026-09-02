@@ -213,4 +213,152 @@ inline void q5_gemv_gfx906_residual_launch(const __nv_bfloat16* x, const std::ui
                                                              residual_out, nullptr);
 }
 
+
+// ---------------------------------------------------------------------------
+// Pass 2, shape 2: Q4 SwiGLU gate/up pair (q4_linear_swiglu_gemv.cu row
+// pairing: gate row r, up row r + kIntermediate).
+//
+//   out[r] = epilogue(Wg[r, :] . x, Wu[r, :] . x)      (silu(gate) * up)
+//
+// Same geometry as q5_gemv_gfx906_kernel (256 threads, 32 lanes per row pair,
+// 2 pairs per wave, 8 pairs per block, grid kIntermediate / 8) but each
+// half-wave streams BOTH rows of its pair: two Q4 chunk streams (16 B nibbles
+// + fp16 scale each, no high plane) and two fp32 accumulators per lane, so the
+// swiglu epilogue needs no cross-wave exchange. x is staged once per block as
+// fp16 in LDS (10 KB at K=5120) with the first chunk loads of both streams
+// issued before the barrier. Decode = Q4TileAtomGfx906::decode_quarter (bias
+// trick) twice per chunk; dot = v_dot2_f32_f16; reduce = gfx906_reduce_sum32.
+
+struct Q4GemvChunkGfx906 {
+    using Storage = Q4RowSplitStorage;
+
+    struct Raw {
+        uint4 words;
+        std::uint16_t scale_bits;
+    };
+
+    // Lane hl of a half-wave owns group step*16 + (hl >> 1), half (hl & 1):
+    // values [group*64 + 32*half, +32).
+    __device__ static __forceinline__ Raw load(const std::uint8_t* __restrict__ code_row,
+                                               const std::uint8_t* __restrict__ scale_row,
+                                               int step, int hl) {
+        const int group = step * (Gfx906GemvGeometry::kLanesPerRow / 2) + (hl >> 1);
+        const int half  = hl & 1;
+        Raw raw;
+        raw.words = *reinterpret_cast<const uint4*>(code_row + group * Storage::kCodeBytesPerGroup +
+                                                    16 * half);
+        raw.scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scale_row + group * Storage::kScaleBytesPerGroup);
+        return raw;
+    }
+
+    // 32 values -> 16 fp16-pair dwords, dst[j] = (value 2j, value 2j+1) scaled.
+    __device__ static __forceinline__ void decode(const Raw& raw, std::uint32_t (&dst)[16]) {
+        Q4TileAtomGfx906::Raw q;
+        q.scale_bits = raw.scale_bits;
+        q.words      = make_uint2(raw.words.x, raw.words.y);
+        Q4TileAtomGfx906::decode_quarter(q, *reinterpret_cast<std::uint32_t(*)[8]>(&dst[0]));
+        q.words = make_uint2(raw.words.z, raw.words.w);
+        Q4TileAtomGfx906::decode_quarter(q, *reinterpret_cast<std::uint32_t(*)[8]>(&dst[8]));
+    }
+};
+
+// Epilogue contract: epilogue(out, row, gate_acc, up_acc) from half-lane 0.
+template <int kIntermediate, int kK, class Epilogue, int kDepth = 2>
+__global__ void __launch_bounds__(Gfx906GemvGeometry::kThreads)
+q4_swiglu_pair_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x,
+                                  const std::uint8_t* __restrict__ codes,
+                                  const std::uint8_t* __restrict__ scales,
+                                  __nv_bfloat16* __restrict__ out, Epilogue epilogue) {
+    using G     = Gfx906GemvGeometry;
+    using Chunk = Q4GemvChunkGfx906;
+    constexpr int kGroups   = kK / Chunk::Storage::kGroupK;
+    constexpr int kSteps    = kK / G::kValuesPerStep;
+    constexpr int kInFlight = kDepth < kSteps ? kDepth : kSteps;
+    static_assert(kK % G::kValuesPerStep == 0, "K must be a multiple of 1024");
+    static_assert(kIntermediate % G::kRowsPerBlock == 0, "N/2 must be a multiple of 8 rows");
+    static_assert(kDepth >= 1, "need at least one chunk in flight");
+
+    __shared__ __align__(16) std::uint32_t x_sh[kK / 2];
+
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int wave   = tid >> 6;
+    const int lane64 = tid & 63;
+    const int half   = lane64 >> 5;
+    const int hl     = lane64 & 31;
+    const int row    = static_cast<int>(blockIdx.x) * G::kRowsPerBlock + wave * G::kRowsPerWave + half;
+
+    const std::uint8_t* gate_code_row =
+        codes + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kCodeBytesPerGroup;
+    const std::uint8_t* gate_scale_row =
+        scales + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kScaleBytesPerGroup;
+    const std::uint8_t* up_code_row =
+        codes + static_cast<std::int64_t>(row + kIntermediate) * kGroups *
+                    Chunk::Storage::kCodeBytesPerGroup;
+    const std::uint8_t* up_scale_row =
+        scales + static_cast<std::int64_t>(row + kIntermediate) * kGroups *
+                     Chunk::Storage::kScaleBytesPerGroup;
+
+    // Both streams' first chunks in flight before the x staging barrier.
+    typename Chunk::Raw raw_g[kInFlight];
+    typename Chunk::Raw raw_u[kInFlight];
+#pragma unroll
+    for (int s = 0; s < kInFlight; ++s) {
+        raw_g[s] = Chunk::load(gate_code_row, gate_scale_row, s, hl);
+        raw_u[s] = Chunk::load(up_code_row, up_scale_row, s, hl);
+    }
+
+    {
+        const auto* x_g = reinterpret_cast<const uint4*>(x);
+        auto* x_s       = reinterpret_cast<uint4*>(x_sh);
+        for (int i = tid; i < kK / 8; i += G::kThreads) {
+            const uint4 v = x_g[i];
+            uint4 h;
+            h.x    = gfx906_bf16x2_to_half2(v.x);
+            h.y    = gfx906_bf16x2_to_half2(v.y);
+            h.z    = gfx906_bf16x2_to_half2(v.z);
+            h.w    = gfx906_bf16x2_to_half2(v.w);
+            x_s[i] = h;
+        }
+    }
+    __syncthreads();
+
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+#pragma unroll
+    for (int s = 0; s < kSteps; ++s) {
+        const int slot                  = s % kInFlight;
+        const typename Chunk::Raw cur_g = raw_g[slot];
+        const typename Chunk::Raw cur_u = raw_u[slot];
+        if (s + kInFlight < kSteps) {
+            raw_g[slot] = Chunk::load(gate_code_row, gate_scale_row, s + kInFlight, hl);
+            raw_u[slot] = Chunk::load(up_code_row, up_scale_row, s + kInFlight, hl);
+        }
+        std::uint32_t wg[16];
+        std::uint32_t wu[16];
+        Chunk::decode(cur_g, wg);
+        Chunk::decode(cur_u, wu);
+
+        const int k0      = (s * (G::kLanesPerRow / 2) + (hl >> 1)) * Chunk::Storage::kGroupK +
+                       G::kValuesPerLane * (hl & 1);
+        const uint4* x_s4 = reinterpret_cast<const uint4*>(x_sh) + (k0 >> 3);
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            const uint4 xv = x_s4[v];
+            acc_g          = gfx906_fdot2(wg[4 * v + 0], xv.x, acc_g);
+            acc_u          = gfx906_fdot2(wu[4 * v + 0], xv.x, acc_u);
+            acc_g          = gfx906_fdot2(wg[4 * v + 1], xv.y, acc_g);
+            acc_u          = gfx906_fdot2(wu[4 * v + 1], xv.y, acc_u);
+            acc_g          = gfx906_fdot2(wg[4 * v + 2], xv.z, acc_g);
+            acc_u          = gfx906_fdot2(wu[4 * v + 2], xv.z, acc_u);
+            acc_g          = gfx906_fdot2(wg[4 * v + 3], xv.w, acc_g);
+            acc_u          = gfx906_fdot2(wu[4 * v + 3], xv.w, acc_u);
+        }
+    }
+
+    acc_g = gfx906_reduce_sum32(acc_g);
+    acc_u = gfx906_reduce_sum32(acc_u);
+    if (hl == 0) { epilogue(out, row, acc_g, acc_u); }
+}
+
 } // namespace ninfer::ops::detail

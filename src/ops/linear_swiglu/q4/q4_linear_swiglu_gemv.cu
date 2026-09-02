@@ -5,6 +5,10 @@
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ops/linear/q4/q4_small_t_mma.cuh"
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/q_gemv_gfx906.cuh"
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -200,6 +204,19 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
+#if defined(NINFER_GFX906_COMPAT)
+// Pass 2 (gfx906): register-resident pair GEMV, q_gemv_gfx906.cuh. Ring depth
+// screened 1/2/3 (stage10/pass2b-depth.sh).
+constexpr int kQ4PairDepthGfx906 = 2;
+
+struct Q4SwiGluPairEpilogueGfx906 {
+    __device__ __forceinline__ void operator()(__nv_bfloat16* __restrict__ out, int row,
+                                               float gate, float up) const {
+        out[row] = __float2bfloat16(silu(gate) * up);
+    }
+};
+#endif
+
 } // namespace
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
@@ -207,6 +224,21 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
+#if defined(NINFER_GFX906_COMPAT)
+    // Pass 2: register-resident wave64 pair GEMV (NINFER_GFX906_PASS2=0 reverts).
+    if (gfx906_pass2_gemv_enabled()) {
+        constexpr int kGrid = kIntermediate / Gfx906GemvGeometry::kRowsPerBlock;
+        q4_swiglu_pair_gemv_gfx906_kernel<kIntermediate, kK, Q4SwiGluPairEpilogueGfx906,
+                                          kQ4PairDepthGfx906>
+            <<<kGrid, Gfx906GemvGeometry::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales),
+                static_cast<__nv_bfloat16*>(out.data), Q4SwiGluPairEpilogueGfx906{});
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
     const int grid = kIntermediate / kPairsPerBlock;
     q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
