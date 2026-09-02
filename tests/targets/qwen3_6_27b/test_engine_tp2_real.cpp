@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,13 @@ ninfer::EngineOptions engine_options(const char* artifact, int tp) {
     options.max_context   = kMaxContext;
     options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(kMaxContext);
     options.prefill_chunk = kPrefillChunk;
+    // gfx906 port: NINFER_TP2_TEST_GRAPHS=0 runs BOTH widths eagerly. On ROCm 6.4.1 a captured
+    // dual-device graph replays correctly but ~65x slower than eager (slice 6 measurement), and
+    // an eager leg separates a capture question from a split question on the 3300-token prompt.
+    if (const char* graphs = std::getenv("NINFER_TP2_TEST_GRAPHS");
+        graphs != nullptr && std::string_view(graphs) == "0") {
+        options.use_cuda_graph = false;
+    }
     options.kv_cache      = ninfer::KvCacheStorage::Int8Group64;
     options.tp            = tp;
     if (tp == 2) {
@@ -72,7 +80,7 @@ ninfer::EngineOptions concurrent_engine_options(const char* artifact, int tp) {
     options.max_context           = kConcurrentContext;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2 * kConcurrentContext);
     options.max_concurrency = 2;
-    options.use_cuda_graph  = true;
+    // use_cuda_graph is inherited from engine_options() above (NINFER_TP2_TEST_GRAPHS=0 -> eager).
     return options;
 }
 
