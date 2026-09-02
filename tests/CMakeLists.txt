@@ -252,6 +252,25 @@ ninfer_add_op_test(ninfer_sparse_moe_test
 ninfer_add_op_test(ninfer_allreduce_test
   SOURCES ops/test_allreduce.cpp
   LIBRARIES ninfer_ops)
+# TP2 split forms (two devices; skip 77 on one). test_mtp_split / test_gdn_headsplit wait on S4.
+ninfer_add_op_test(ninfer_linear_split_test
+  SOURCES ops/test_linear_split.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_add_split_test
+  SOURCES ops/test_linear_add_split.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_swiglu_split_test
+  SOURCES ops/test_linear_swiglu_split.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_attn_input_proj_split_test
+  SOURCES ops/test_attn_input_proj_split.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_projections_split_test
+  SOURCES ops/test_gdn_projections_split.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_output_head_split_test
+  SOURCES ops/test_output_head_split.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES ninfer_ops)

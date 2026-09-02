@@ -230,20 +230,18 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {
-    if (records.spec.layers == FoldGeometry48x48::kLayers &&
-        records.spec.qk_heads == FoldGeometry48x48::kQkHeads &&
-        records.spec.value_heads == FoldGeometry48x48::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry48x48::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows, stream);
-        return;
+    // Generated from NINFER_GDN_FOLD_GEOMETRIES (recurrent.cuh) so registering a geometry reaches
+    // this dispatch by construction; the trailing throw is preserved.
+#define NINFER_GDN_FOLD_DISPATCH_ARM(Geometry)                                                     \
+    if (records.spec.layers == Geometry::kLayers &&                                                \
+        records.spec.qk_heads == Geometry::kQkHeads &&                                             \
+        records.spec.value_heads == Geometry::kValueHeads &&                                       \
+        records.spec.conv_channels == Geometry::kConvChannels) {                                   \
+        launch_replay_fold_fixed<Geometry>(records, states, rows, active_rows, stream);            \
+        return;                                                                                    \
     }
-    if (records.spec.layers == FoldGeometry30x32::kLayers &&
-        records.spec.qk_heads == FoldGeometry30x32::kQkHeads &&
-        records.spec.value_heads == FoldGeometry30x32::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry30x32::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows, stream);
-        return;
-    }
+    NINFER_GDN_FOLD_GEOMETRIES(NINFER_GDN_FOLD_DISPATCH_ARM)
+#undef NINFER_GDN_FOLD_DISPATCH_ARM
     throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
 }
 

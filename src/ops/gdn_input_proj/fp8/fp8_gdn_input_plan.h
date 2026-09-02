@@ -36,4 +36,10 @@ void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qk
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 
+
+// TP2 column-shard form (donor tp2 plumbing; gfx906 stubs it in ops/gfx906_stubs.cpp).
+void fp8_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                  Tensor& z, LinearPolicy policy, WorkspaceArena* workspace,
+                                  cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

@@ -104,7 +104,17 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = qk_heads == 16 && (value_heads == 48 || value_heads == 32);
+    // Registered head geometries. The launcher is entirely runtime-dimensioned in the head
+    // counts (`launch_recurrent_record_fixed` takes grid.x = v.ne[1] and builds its value->qk map
+    // with `head_map::of(q.ne[1], v.ne[1])` at run time), so a geometry is registered by being
+    // QUALIFIED, not by adding a kernel. `8|24` is the tp == 2 shard of `16|48`: both the qk-head
+    // and the value-head counts halve, the group size 48/16 == 24/8 == 3 is preserved, and the
+    // split is group-aligned so no group of three value heads is ever cut. It is the geometry the
+    // MTP/speculative verify round records on each device at tp == 2, and it is the exact partner
+    // of FoldGeometry48x24Tp2 in `is_registered_fold_geometry` below -- a record written at this
+    // geometry is folded at that one, so the two entries must exist together.
+    const bool registered_heads = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
+                                  (qk_heads == 8 && value_heads == 24);
     if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -151,12 +161,23 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_pairwise_disjoint(ranges, "gated_delta_net_replay_record: tensors must not overlap");
 }
 
+// Host-side mirror of NINFER_GDN_FOLD_GEOMETRIES in
+// src/ops/linear_attention/gated_delta_net/recurrent.cuh. This TU is plain C++ and this repository
+// keeps `.cuh` device-side (included only from `.cu`), so the literals are duplicated here the same
+// way `kv_heads_for_q_heads` mirrors the GQA registry in src/ops/wrapper/gqa_attention.cpp. The
+// failure mode is safe in one direction only: a MISSING entry makes the Op reject a geometry the
+// launcher would have run, while an entry here with no launcher arm would reach
+// `launch_replay_fold`'s trailing throw. Keep the two lists edited together.
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
     const bool geometry_48 = spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
                              spec.conv_channels == 10240;
     const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
                              spec.conv_channels == 8192;
-    return geometry_48 || geometry_30;
+    // FoldGeometry48x24Tp2: device r's half of geometry_48 at tp == 2. Both the qk-head and the
+    // value-head counts halve, together with the conv channel count.
+    const bool geometry_48_tp2 = spec.layers == 48 && spec.qk_heads == 8 &&
+                                 spec.value_heads == 24 && spec.conv_channels == 5120;
+    return geometry_48 || geometry_30 || geometry_48_tp2;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

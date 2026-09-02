@@ -26,4 +26,10 @@ void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& o
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream);
 
+
+// TP2 column-shard form (donor tp2 plumbing; gfx906 stubs it in ops/gfx906_stubs.cpp).
+void fp8_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& out,
+                                      LinearPolicy policy, WorkspaceArena* workspace,
+                                      cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

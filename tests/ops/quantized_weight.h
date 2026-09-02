@@ -312,6 +312,14 @@ struct PatternedWeightOptions {
     RowSplitCodePattern row_split_codes  = RowSplitCodePattern::Coordinate;
     float weight_scale_divisor           = 0.0F;
     float input_scale_divisor            = 0.0F;
+    // TP2 shard support (Coordinate codes only): the pattern is evaluated at the GLOBAL
+    // (row + row_origin, column + column_origin) coordinate, so a shard built with the parent's
+    // origins equals the parent's slice byte for byte. column_origin must be a multiple of the
+    // group size. decorrelate_coordinates folds a hash of the global coordinate into the codes
+    // and scales so the two shards of an affine rule are never periodic copies of each other.
+    std::int32_t row_origin              = 0;
+    std::int32_t column_origin           = 0;
+    bool decorrelate_coordinates         = false;
 };
 
 // Builds a deterministic full-shape payload without allocating a source or dequantized matrix.
@@ -510,16 +518,35 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
 
     const std::uint64_t code_bytes_per_group = detail::nibble_bytes_per_group(spec);
     const std::uint64_t high_bytes_per_group = detail::high_bytes_per_group(spec);
+    if (options.row_origin < 0 || options.column_origin < 0 ||
+        options.column_origin % spec.group_size != 0) {
+        throw std::invalid_argument(
+            "quantized-weight fixture: shard origins must be non-negative and column_origin a "
+            "multiple of the group size");
+    }
+    const std::uint64_t row_origin   = static_cast<std::uint64_t>(options.row_origin);
+    const std::uint64_t group_origin = static_cast<std::uint64_t>(options.column_origin) /
+                                       static_cast<std::uint64_t>(spec.group_size);
+    const auto coordinate_mix = [&](std::uint64_t global_row, std::uint64_t global_group) {
+        return options.decorrelate_coordinates
+                   ? detail::mix64((global_row << 32) ^ global_group ^
+                                   (static_cast<std::uint64_t>(seed) << 11))
+                   : std::uint64_t{0};
+    };
     if (options.row_split_codes == RowSplitCodePattern::Coordinate) {
         for (std::uint64_t group_index = 0; group_index < groups; ++group_index) {
-            const std::uint64_t row   = group_index / static_cast<std::uint64_t>(kg);
-            const std::uint64_t group = group_index % static_cast<std::uint64_t>(kg);
-            if (group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
+            const std::uint64_t local_row   = group_index / static_cast<std::uint64_t>(kg);
+            const std::uint64_t local_group = group_index % static_cast<std::uint64_t>(kg);
+            if (local_group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
+            const std::uint64_t row   = local_row + row_origin;
+            const std::uint64_t group = local_group + group_origin;
+            const std::uint64_t mixed = coordinate_mix(row, group);
             const std::uint32_t row_mix =
                 static_cast<std::uint32_t>(row ^ (row >> 8) ^ (row >> 16));
             for (std::uint64_t byte = 0; byte < code_bytes_per_group; ++byte) {
                 std::uint8_t code = static_cast<std::uint8_t>(
-                    (row_mix * 37u + group * 29u + byte * 17u + seed) & 0xffu);
+                    (row_mix * 37u + group * 29u + byte * 17u + seed +
+                     ((mixed >> (8 * (byte % 8))) & 0xffu)) & 0xffu);
                 if (qtype == QType::W8G32_F16S && code == 0x80u) { code = 0x81u; }
                 packed
                     .payload[static_cast<std::size_t>(group_index * code_bytes_per_group + byte)] =
@@ -529,7 +556,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 packed.payload[static_cast<std::size_t>(
                     packed.high_plane_offset + group_index * high_bytes_per_group + byte)] =
                     static_cast<std::uint8_t>(
-                        (row_mix * 43u + group * 31u + byte * 13u + seed * 3u) & 0xffu);
+                        (row_mix * 43u + group * 31u + byte * 13u + seed * 3u +
+                         ((mixed >> (8 * ((byte + 3) % 8))) & 0xffu)) & 0xffu);
             }
         }
     } else {
@@ -599,13 +627,15 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         break;
     }
     for (std::uint64_t i = 0; i < groups; ++i) {
-        const std::uint64_t row   = i / static_cast<std::uint64_t>(kg);
-        const std::uint64_t group = i % static_cast<std::uint64_t>(kg);
-        if (group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
+        const std::uint64_t local_row   = i / static_cast<std::uint64_t>(kg);
+        const std::uint64_t local_group = i % static_cast<std::uint64_t>(kg);
+        if (local_group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
+        const std::uint64_t row   = local_row + row_origin;
+        const std::uint64_t group = local_group + group_origin;
         const std::uint64_t scale_index =
             options.row_split_codes == RowSplitCodePattern::Hashed
                 ? (detail::mix64(i ^ (static_cast<std::uint64_t>(seed) << 17)) >> 8) & 3U
-                : (row ^ (row >> 8) ^ group ^ seed) & 3U;
+                : (row ^ (row >> 8) ^ group ^ seed ^ (coordinate_mix(row, group) >> 61)) & 3U;
         detail::store_u16_le(packed.payload,
                              static_cast<std::size_t>(packed.scale_plane_offset + i * 2),
                              scales[scale_index]);

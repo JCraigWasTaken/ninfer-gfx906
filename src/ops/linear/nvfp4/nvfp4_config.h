@@ -110,6 +110,9 @@ using Nvfp4GdnInputGeometry      = Nvfp4GemvGeometry<16384, 5120>;
 using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
+// TP2 row-parallel shard extents (donor tp2 plumbing; admitted by the wrapper shape gate only).
+using Nvfp4Residual6144Tp2RowGeometry  = Nvfp4GemvGeometry<5120, 3072>;
+using Nvfp4Residual17408Tp2RowGeometry = Nvfp4GemvGeometry<5120, 8704>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;

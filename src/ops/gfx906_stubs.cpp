@@ -317,7 +317,7 @@ void nvfp4_linear_add_w4a4_launch(const Tensor&, const Weight&, Tensor&, Nvfp4W4
                                   cudaStream_t) {
     reject_nvfp4();
 }
-void nvfp4_linear_add_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, WorkspaceArena&,
+void nvfp4_linear_add_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, WorkspaceArena*,
                                cudaStream_t) {
     reject_nvfp4();
 }
@@ -395,6 +395,38 @@ void sparse_moe_small_t_launch(const Tensor&, const SparseMoeWeights&, Tensor&,
                                const SparseMoeSmallTPlan&, const SparseMoeSmallTWorkspace&,
                                cudaStream_t) {
     reject_moe();
+}
+
+
+// --- TP2 shard forms (donor tp2 plumbing; fp8/nvfp4 kernels are not built) ----
+
+void fp8_attn_input_dispatch_shard(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
+                                   Tensor&, LinearPolicy, WorkspaceArena*, cudaStream_t) {
+    reject_fp8();
+}
+void nvfp4_attn_input_dispatch_shard(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
+                                     Tensor&, LinearPolicy, WorkspaceArena*, cudaStream_t) {
+    reject_nvfp4();
+}
+void fp8_gdn_input_dispatch_shard(const Tensor&, const Weight&, Tensor&, Tensor&, LinearPolicy,
+                                  WorkspaceArena*, cudaStream_t) {
+    reject_fp8();
+}
+void nvfp4_gdn_input_dispatch_shard(const Tensor&, const Weight&, Tensor&, Tensor&, LinearPolicy,
+                                    WorkspaceArena*, cudaStream_t) {
+    reject_nvfp4();
+}
+std::size_t nvfp4_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy, std::int32_t,
+                                                               std::int32_t) {
+    reject_nvfp4();
+}
+void nvfp4_linear_swiglu_dispatch_shard(const Tensor&, const Weight&, Tensor&, LinearPolicy,
+                                        WorkspaceArena*, cudaStream_t) {
+    reject_nvfp4();
+}
+void fp8_linear_swiglu_dispatch_shard(const Tensor&, const Weight&, Tensor&, LinearPolicy,
+                                      WorkspaceArena*, cudaStream_t) {
+    reject_fp8();
 }
 
 } // namespace ninfer::ops::detail

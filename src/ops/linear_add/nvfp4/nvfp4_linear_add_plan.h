@@ -28,6 +28,6 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream);
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                               LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -26,4 +26,13 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream);
 
+
+// TP2 column-shard form (donor tp2 plumbing; gfx906 stubs it in ops/gfx906_stubs.cpp).
+std::size_t nvfp4_linear_swiglu_shard_workspace_capacity_bytes(LinearPolicy policy,
+                                                               std::int32_t min_tokens,
+                                                               std::int32_t max_tokens);
+void nvfp4_linear_swiglu_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& out,
+                                        LinearPolicy policy, WorkspaceArena* workspace,
+                                        cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

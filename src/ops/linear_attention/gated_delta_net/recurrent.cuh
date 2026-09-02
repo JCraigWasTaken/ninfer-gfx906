@@ -488,6 +488,22 @@ struct FoldGeometry {
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
 
+// tp2 head/channel shard of FoldGeometry48x48. It is the one place in the GDN family where a head
+// split is not free: the qk-head parameter halves too -- the fold kernel derives its own
+// value-head -> qk-head map from (kQkHeads, kValueHeads) via head_map, and a group-aligned split
+// keeps that map exact: local h maps to local h/(24/8) = h/3, which is global (24r+h)/3 =
+// 8r + h/3, the same qk head the tp1 geometry assigns. Both of FoldGeometry's static_asserts hold
+// (24 % 8 == 0, 5120 % 128 == 0).
+using FoldGeometry48x24Tp2 = FoldGeometry<48, 8, 24, 5120>;
+
+// Every registered fold geometry, in one place, so `launch_replay_fold`'s dispatch chain is
+// generated rather than hand-written: a newly registered geometry must not be left behind in a
+// hand-written switch.
+#define NINFER_GDN_FOLD_GEOMETRIES(X)                                                              \
+    X(FoldGeometry48x48)                                                                           \
+    X(FoldGeometry30x32)                                                                           \
+    X(FoldGeometry48x24Tp2)
+
 template <class Geometry>
 struct FoldAccess {
     const __nv_bfloat16* key_record;
