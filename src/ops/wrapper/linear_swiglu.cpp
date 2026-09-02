@@ -7,6 +7,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
@@ -243,6 +244,11 @@ void q4_column_parallel_rank(const Tensor& x, const Weight& w, Tensor& out,
     if (workspace == nullptr) {
         throw std::invalid_argument("linear_swiglu column-parallel: Q4 requires caller workspace");
     }
+#if defined(NINFER_GFX906_COMPAT)
+    // TP2 slice 7: T=1..5 ride the gfx906 pass-2 pair GEMV at kIntermediate = 8704
+    // (NINFER_GFX906_PASS2=0, or T > 5, keeps the composition below).
+    if (detail::q4_linear_swiglu_gemv_pair_shard_gfx906_launch(x, w, out, stream)) { return; }
+#endif
     auto scope                  = workspace->scope();
     const Tensor materialized   = workspace->alloc(DType::BF16, {w.n, x.ne[1]}, 256);
     Tensor projected            = materialized;

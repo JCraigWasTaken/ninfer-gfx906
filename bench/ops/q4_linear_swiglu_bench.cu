@@ -3,6 +3,9 @@
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
+#include "ninfer/ops/linear.h"
+#include "ninfer/ops/silu_mul.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 
@@ -32,6 +35,7 @@ struct Options {
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
+    bool shard   = false; // TP2 gate_up column shard [17408,5120] -> out [8704,T]
 };
 
 std::vector<std::int32_t> parse_tokens(std::string_view raw) {
@@ -67,6 +71,8 @@ Options parse_options(int argc, char** argv) {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (argument == "--repeat") {
             options.repeat = std::stoi(std::string(next("--repeat value")));
+        } else if (argument == "--shard") {
+            options.shard = true;
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
@@ -99,17 +105,38 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);
+        const std::int32_t gate_up_rows = options.shard ? kGateUpRows / 2 : kGateUpRows;
+        const std::int32_t output_rows  = options.shard ? kOutputRows / 2 : kOutputRows;
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
-        DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
+        DeviceBuffer output(static_cast<std::size_t>(output_rows) * max_t * sizeof(std::uint16_t));
+        DeviceBuffer projected(static_cast<std::size_t>(gate_up_rows) * max_t *
+                               sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
-            QType::Q4G64_F16S, kGateUpRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
-        const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::Q4G64_F16S, kGateUpRows, kHidden, min_t, max_t);
+            QType::Q4G64_F16S, gate_up_rows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
+        const std::size_t workspace_capacity =
+            options.shard ? 0
+                          : ops::linear_swiglu_workspace_capacity_bytes(
+                                QType::Q4G64_F16S, kGateUpRows, kHidden, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
+            Tensor out(output.p, DType::BF16, {output_rows, tokens});
+            if (options.shard) {
+                // The tp2 column-parallel rank body (src/ops/wrapper/linear_swiglu.cpp):
+                // pass-2 pair shard GEMV when its domain admits, else linear + silu_mul.
+#if defined(NINFER_GFX906_COMPAT)
+                if (ops::detail::q4_linear_swiglu_gemv_pair_shard_gfx906_launch(
+                        x, packed.weight, out, launch_stream)) {
+                    return;
+                }
+#endif
+                Tensor proj(projected.p, DType::BF16, {gate_up_rows, tokens});
+                ops::linear(x, packed.weight, proj, launch_stream);
+                ops::silu_mul(proj.slice(0, 0, output_rows), proj.slice(0, output_rows, output_rows),
+                              out, launch_stream);
+                return;
+            }
             ops::linear_swiglu(x, packed.weight, out, workspace, launch_stream);
         };
 
@@ -127,12 +154,12 @@ int main(int argc, char** argv) {
                 [&](cudaStream_t launch_stream) { launch(tokens, launch_stream); }, flush, stream,
                 options.warmup, options.repeat);
             const double seconds = timing.median_us * 1.0e-6;
-            const double flops   = 2.0 * static_cast<double>(kGateUpRows) * kHidden * tokens;
+            const double flops   = 2.0 * static_cast<double>(gate_up_rows) * kHidden * tokens;
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
-                                 2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
-            std::printf("T=%-3d median=%8.3f us %7.1f GB/s %7.2f TFLOP/s workspace=%zu\n", tokens,
-                        timing.median_us, bytes / seconds / 1.0e9, flops / seconds / 1.0e12,
-                        workspace_capacity);
+                                 2.0 * static_cast<double>(kHidden + output_rows) * tokens;
+            std::printf("%sT=%-3d median=%8.3f us %7.1f GB/s %7.2f TFLOP/s workspace=%zu\n",
+                        options.shard ? "shard[17408,5120] " : "", tokens, timing.median_us,
+                        bytes / seconds / 1.0e9, flops / seconds / 1.0e12, workspace_capacity);
         }
 
         CUDA_CHECK(cudaStreamDestroy(stream));

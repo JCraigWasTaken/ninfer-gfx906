@@ -307,6 +307,72 @@ bool q4_linear_swiglu_gemv_pair_smallt_gfx906_launch(const Tensor& x, const Weig
 }
 #endif
 
+#if defined(NINFER_GFX906_COMPAT)
+// TP2 slice 7: gate_up column-parallel shard. bindings.cpp splits mlp/gate_up
+// as two column blocks (gate half, then up half), so rank r holds gate rows
+// [0,8704) followed by up rows [8704,17408) of its half: the pair kernel's
+// row r / row r + kIntermediate pairing holds with kIntermediate = 8704.
+constexpr int kShardN            = 17408;
+constexpr int kShardIntermediate = kShardN / 2;
+
+bool q4_linear_swiglu_gemv_pair_shard_gfx906_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                    cudaStream_t stream) {
+    if (w.n != kShardN || w.k != kK || w.padded_shape[1] != kK ||
+        out.ne[0] != kShardIntermediate || !gfx906_pass2_gemv_enabled()) {
+        return false;
+    }
+    const int t      = x.ne[1];
+    const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* qd   = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* sc   = static_cast<const std::uint8_t*>(w.scales);
+    auto* op         = static_cast<__nv_bfloat16*>(out.data);
+    const Q4SwiGluPairEpilogueGfx906 epilogue{};
+    if (t == 1) {
+        constexpr int kGrid = kShardIntermediate / Gfx906GemvGeometry::kRowsPerBlock;
+        q4_swiglu_pair_gemv_gfx906_kernel<kShardIntermediate, kK, Q4SwiGluPairEpilogueGfx906,
+                                          kQ4PairDepthGfx906>
+            <<<kGrid, Gfx906GemvGeometry::kThreads, 0, stream>>>(xp, qd, sc, op, epilogue);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    if (t < 2 || t > 5 || !gfx906_pass2_smallt_enabled()) { return false; }
+    const int x_ld   = static_cast<int>(x.nb[1] / sizeof(__nv_bfloat16));
+    const int out_ld = static_cast<int>(out.nb[1] / sizeof(__nv_bfloat16));
+    switch (t) {
+    case 2:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kShardIntermediate, kK, 2,
+                                                 Q4SwiGluPairEpilogueGfx906,
+                                                 kQ4PairSmallTThreadsGfx906,
+                                                 kQ4PairSmallTLdsCapGfx906>(
+            xp, x_ld, qd, sc, op, out_ld, epilogue, stream);
+        break;
+    case 3:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kShardIntermediate, kK, 3,
+                                                 Q4SwiGluPairEpilogueGfx906,
+                                                 kQ4PairSmallTThreadsGfx906,
+                                                 kQ4PairSmallTLdsCapGfx906>(
+            xp, x_ld, qd, sc, op, out_ld, epilogue, stream);
+        break;
+    case 4:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kShardIntermediate, kK, 4,
+                                                 Q4SwiGluPairEpilogueGfx906,
+                                                 kQ4PairSmallT45ThreadsGfx906,
+                                                 kQ4PairSmallT45LdsCapGfx906>(
+            xp, x_ld, qd, sc, op, out_ld, epilogue, stream);
+        break;
+    default:
+        q4_swiglu_pair_gemv_smallt_gfx906_launch<kShardIntermediate, kK, 5,
+                                                 Q4SwiGluPairEpilogueGfx906,
+                                                 kQ4PairSmallT45ThreadsGfx906,
+                                                 kQ4PairSmallT45LdsCapGfx906>(
+            xp, x_ld, qd, sc, op, out_ld, epilogue, stream);
+        break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif
+
 void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream) {
     if (x.ne[1] < 2 || x.ne[1] > 32) {
