@@ -10,6 +10,8 @@
 #endif
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "ops/launcher/gqa_geometry_dispatch.cuh"
+#include "ops/launcher/kernel_attr_once.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -60,14 +62,11 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     CUDA_CHECK(cudaGetLastError());
 #else
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    static const cudaError_t attr_bf16 =
-        cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
-    CUDA_CHECK(attr_bf16);
-    static const cudaError_t attr_i8 =
-        cudaFuncSetAttribute(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
-    CUDA_CHECK(attr_i8);
+    // Per-device once-guard: the opt-in is a per-device kernel property.
+    ensure_func_attr_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
+    ensure_func_attr_per_device(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
@@ -166,24 +165,19 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
-        return;
-    }
-    gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
-                                                             out, stream);
+    dispatch_gqa_geometry(q.ne[1], [&]<typename Geometry>() {
+        gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache, metadata,
+                                                            out, stream);
+    });
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (k.ne[1] == Gqa27Geometry::KVHeads) {
-        gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-        return;
-    }
-    gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+    dispatch_gqa_kv_geometry(k.ne[1], [&]<typename Geometry>() {
+        gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);
+    });
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -198,15 +192,11 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
-        if (q.ne[1] == Gqa27Geometry::QHeads) {
-            gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-            gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream);
-            return;
-        }
-        gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
-        gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+        dispatch_gqa_geometry(q.ne[1], [&]<typename Geometry>() {
+            gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                                metadata, out, stream);
+        });
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

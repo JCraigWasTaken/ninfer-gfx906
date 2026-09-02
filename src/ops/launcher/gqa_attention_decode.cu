@@ -10,6 +10,8 @@
 #endif
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "ops/launcher/gqa_geometry_dispatch.cuh"
+#include "ops/launcher/kernel_attr_once.h"
 #include "ninfer/ops/gqa_attention.h"
 
 #include <cstdint>
@@ -169,12 +171,11 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         constexpr std::size_t kDynamicBytes =
             DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0u;
         if constexpr (DynamicArena) {
-            static const cudaError_t attr = cudaFuncSetAttribute(
+            ensure_func_attr_per_device(
                 gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
                                                      MinBlocksPerSm, KeyBlock, DynamicArena,
                                                      MultiBatch, Masked, CacheInput>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
-            CUDA_CHECK(attr);
         }
         gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                              KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput>
@@ -266,13 +267,9 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
-    if (q_heads == Gqa27Geometry::QHeads) {
-        return gqa_small_t_launch_capacity<Gqa27Geometry>(envelope, tokens, cache_dtype);
-    }
-    if (q_heads == Gqa35Geometry::QHeads) {
-        return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
-    }
-    throw std::invalid_argument("gqa_attention split capacity: unsupported head geometry");
+    return dispatch_gqa_geometry(q_heads, [&]<typename Geometry>() {
+        return gqa_small_t_launch_capacity<Geometry>(envelope, tokens, cache_dtype);
+    });
 }
 
 template <typename Geometry, typename CacheInput>
@@ -404,15 +401,11 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         .width         = width,
         .batch_size    = q.ne[3],
     };
-    if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
-                                                        envelope, partial_acc, partial_m, partial_l,
-                                                        out, stream);
-        return;
-    }
-    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
-                                                    envelope, partial_acc, partial_m, partial_l,
-                                                    out, stream);
+    dispatch_gqa_geometry(q.ne[1], [&]<typename Geometry>() {
+        gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
+                                                   envelope, partial_acc, partial_m, partial_l, out,
+                                                   stream);
+    });
 }
 
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
@@ -430,15 +423,11 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
         .batch_size    = 1,
     };
     const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
-    if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
-                                                        invocation, envelope, partial_acc,
-                                                        partial_m, partial_l, out, stream);
-        return;
-    }
-    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, batch_cache, invocation,
-                                                    envelope, partial_acc, partial_m, partial_l,
-                                                    out, stream);
+    dispatch_gqa_geometry(q.ne[1], [&]<typename Geometry>() {
+        gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, batch_cache, invocation,
+                                                   envelope, partial_acc, partial_m, partial_l, out,
+                                                   stream);
+    });
 }
 
 } // namespace ninfer::ops::detail

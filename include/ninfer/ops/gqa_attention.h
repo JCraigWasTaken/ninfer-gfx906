@@ -66,7 +66,15 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  *   probability   = softmax_x(score)
  *   ideal[:,h,j,b] = sum_x probability[x] * V_cache[b][:,x,kvh].
  *
- * The registered geometries are `[256,24|4,W,B]` group 6 and `[256,16|2,W,B]` group 8.
+ * The registered geometries are `[256,24|4,W,B]` group 6, `[256,16|2,W,B]` group 8, and
+ * `[256,12|2,W,B]` group 6 -- the head-local half of `24|4` that ONE device computes under
+ * two-way tensor parallelism. Under that geometry the caller has already split heads: q/out
+ * carry that device's own 12 query heads, k/v its own 2 KV heads, and `cache` addresses a pool
+ * whose `num_kv_heads` is 2 and which stores ONLY that device's two KV head pairs. Every head
+ * index the Op sees is therefore device-local (`q_head` in [0,12), `kv_head = q_head/6` in
+ * [0,2)); the Op never learns, and never needs, a global head number. Softmax is exact and
+ * entirely local because a query head reads only its own KV head, so the split introduces no
+ * cross-device dependency and no collective.
  * q/k/v/out are contiguous BF16 in request-major order, positions is contiguous I32 [W,B], and
  * kv_table_rows is contiguous I32 [B]. valid_columns is either contiguous I32 [B], or an empty
  * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
@@ -93,7 +101,9 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
- * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
+ * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]` (a 2-head
+ * pool is the tp2 head-local pool as well as the `16|2` geometry's; the append reads only the
+ * KV-head count, so the two are the same operation), positions is
  * contiguous sequential I32 [T], and every addressed code and INT8 scale is overwritten. It reads
  * no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
  */
@@ -102,7 +112,7 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 
 /**
  * A3: compute causal attention from an already populated cache without accepting new K/V or
- * mutating any cache plane. q/out are contiguous BF16 `[256,24|16,T]`, positions is contiguous
+ * mutating any cache plane. q/out are contiguous BF16 `[256,24|16|12,T]`, positions is contiguous
  * sequential I32 [T], and the mathematical formula and execution-envelope contract are identical
  * to A1. Caller workspace is reported by gqa_attention_workspace_capacity_bytes().
  */

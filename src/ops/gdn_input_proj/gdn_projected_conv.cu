@@ -126,6 +126,17 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
                                        initial_state_slots, query, key, value, publish, stream);
         return;
     }
+    // TP2 head-local shard of the 27B geometry (docs/gfx906/TP2-SLICES.md, S3 collision fix 4):
+    // device r owns qk heads [8r,8r+8) and value heads [24r,24r+24), so its projected conv
+    // channels are 1024 | 1024 | 3072 = 5120. On gfx906 the shard always takes the Materialized
+    // route (q4_q5_gdn_input_conv_resolve_plan), which lands here; the tp1 rows above are
+    // consulted first, so tp=1 dispatch is unchanged.
+    if (projected.ne[0] == 5120 && query.ne[0] == 1024 && key.ne[0] == 1024 &&
+        value.ne[0] == 3072) {
+        launch<5120, 1024, 1024, 3072>(projected, conv_weight, state_read, valid_columns,
+                                       initial_state_slots, query, key, value, publish, stream);
+        return;
+    }
     throw std::invalid_argument("GDN projected-conv received an unregistered geometry");
 }
 

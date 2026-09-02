@@ -23,9 +23,16 @@ constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 
+// Mirrors the registered head geometries in src/ops/kernel/gqa_attention_geometry.cuh
+// (NINFER_GQA_GEOMETRIES): 24|4 group 6, 16|2 group 8, and 12|2 group 6 -- the head-local half of
+// 24|4 that one device runs under two-way tensor parallelism, whose KV pool stores only its own
+// two head pairs. That header is device-side and deliberately not included from this host TU; the
+// three pairs below are the whole of the duplication and any fourth geometry must be added here
+// too or the Op rejects it before it can reach a launcher.
 std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     if (q_heads == 24) { return 4; }
     if (q_heads == 16) { return 2; }
+    if (q_heads == 12) { return 2; }
     throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
 }
 
