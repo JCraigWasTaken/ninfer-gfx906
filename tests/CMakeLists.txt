@@ -145,6 +145,30 @@ target_include_directories(ninfer_qwen3_6_27b_sharded_materialization_test PRIVA
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_sharded_materialization_test PRIVATE hip::host)
 set_tests_properties(ninfer_qwen3_6_27b_sharded_materialization_test PROPERTIES SKIP_RETURN_CODE 77)
+# TP2 engine bring-up (donor tests; gfx906 port links hip::host instead of CUDA::cudart).
+# Each skips (77) unless NINFER_QWEN3_8_27B_WEIGHTS names an artifact AND two devices are visible.
+ninfer_add_test(ninfer_qwen3_8_27b_tp2_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_tp2_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_8_27b_tp2_real_test PRIVATE hip::host)
+set_tests_properties(ninfer_qwen3_8_27b_tp2_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+ninfer_add_test(ninfer_qwen3_8_27b_mtp_tp2_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_mtp_tp2_real.cpp
+  LIBRARIES ninfer_engine ninfer_product_prompt_input)
+target_link_libraries(ninfer_qwen3_8_27b_mtp_tp2_real_test PRIVATE hip::host)
+set_tests_properties(ninfer_qwen3_8_27b_mtp_tp2_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+ninfer_add_test(ninfer_qwen3_8_27b_graph_tp2_test
+  SOURCES targets/qwen3_6_27b/test_graph_tp2.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_8_27b_graph_tp2_test PRIVATE hip::host)
+set_tests_properties(ninfer_qwen3_8_27b_graph_tp2_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Greedy tp1-vs-tp2 numerical parity harness. Source lives under tools/tp2/ because it is a
+# tool (env NINFER_TP2_PARITY_KV / _OUTPUT / _DUMP_DIR); registered here so ctest runs it as the gate.
+ninfer_add_test(ninfer_qwen3_8_27b_tp2_parity_test
+  SOURCES ${PROJECT_SOURCE_DIR}/tools/tp2/parity.cpp
+  LIBRARIES ninfer_engine ninfer_product_prompt_input)
+target_link_libraries(ninfer_qwen3_8_27b_tp2_parity_test PRIVATE hip::host)
+set_tests_properties(ninfer_qwen3_8_27b_tp2_parity_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)

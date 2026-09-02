@@ -8,3 +8,5 @@ foreach(probe IN ITEMS p2p_probe transport_probe capture_probe)
   ninfer_cuda_archive(ninfer_tp2_${probe})
   target_link_libraries(ninfer_tp2_${probe} PRIVATE ninfer_core)
 endforeach()
+# parity.cpp (tp1-vs-tp2 teacher-forced parity gate) is built and registered from
+# tests/CMakeLists.txt as ninfer_qwen3_8_27b_tp2_parity_test so ctest owns its TIMEOUT.
