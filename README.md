@@ -5,13 +5,14 @@ the first AMD target in the NInfer ecosystem.
 
 ## Status
 
-**Stages 1–8 complete: fast prefill and working speculation on a real MI50**
-— end-to-end tokens validated against llama.cpp (stage 4), HIP graphs (5),
-MTP speculative decoding (6), int8-KV attention (7), and the wave64
-LDS-tiled grouped-int GEMM rewrites (8): prefill ~9 → ~170 tok/s on the
-stage-4 probe and MTP now beats plain decode (code, draft 3: ~24 vs ~13
-tok/s). Attention/dispatch retuning (step 10) is next; GDN chunked prefill
-(9) is deferred on measurement (~5% of prefill).
+**Stages 1-8 complete; stage 10 (retune) in progress on a cooled MI50.**
+Baseline on card 2 after cooling (2026-09-02): plain decode 12.7 tok/s, MTP code
+draft-3 22.9 tok/s, prefill 212 tok/s at 512 tokens, deep-context tool-call
+probe 7/7 at 30.9K tokens with output identical to llama.cpp. The rocprof
+trace shows decode is kernel-bound: four T=1 GEMV kernels take 66 of 79 ms per
+token at a quarter of the available bandwidth, so the GEMV retune is the next
+lever, then prefill attention (quadratic past ~30K). Plan, numbers, and
+predictions: docs/gfx906/STAGE10-LOG.md.
 
 - [`docs/gfx906/PORT-AUDIT.md`](docs/gfx906/PORT-AUDIT.md) — kernel census, port order, donor map
 - [`docs/gfx906/STAGE1-LOG.md`](docs/gfx906/STAGE1-LOG.md) · [`STAGE3-LOG.md`](docs/gfx906/STAGE3-LOG.md) · [`STAGE4-LOG.md`](docs/gfx906/STAGE4-LOG.md) · [`STAGE5-7-LOG.md`](docs/gfx906/STAGE5-7-LOG.md) · [`STAGE8-9-LOG.md`](docs/gfx906/STAGE8-9-LOG.md) — stage logs
