@@ -72,7 +72,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
 
     const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
+    if (cache.k_pages.dtype != code_dtype ||
+        cache.v_pages.dtype != (cache.dtype == DType::I8 ? DType::I8 : DType::FP16)) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
     require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
@@ -130,7 +131,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
 
     const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
+    if (cache.k_pages.dtype != code_dtype ||
+        cache.v_pages.dtype != (cache.dtype == DType::I8 ? DType::I8 : DType::FP16)) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
     require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,

@@ -25,7 +25,7 @@ template <typename Geometry, typename Metadata>
 __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
-    __nv_bfloat16* __restrict__ cache_k, __nv_bfloat16* __restrict__ cache_v, std::int32_t width) {
+    __nv_bfloat16* __restrict__ cache_k, __half* __restrict__ cache_v, std::int32_t width) {
     constexpr int VecElems = 8; // 8 bf16 == 16 B, matching the cache row alignment.
     const int tokens       = metadata.valid_tokens(width);
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -53,7 +53,7 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const std::int64_t cache_off = paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
         physical_page, kv_head, position & kPagedKVPageMask, d);
     store_vec(&cache_k[cache_off], k_value);
-    store_vec(&cache_v[cache_off], v_value);
+    store_vec(&cache_v[cache_off], bf16x8_bits_to_f16x8_bits(v_value));
 }
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the

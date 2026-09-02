@@ -30,6 +30,7 @@
 //   - identical exp2_approx softmax basis (Log2E), bf16-rounded partial acc
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_decode.cuh"
@@ -42,7 +43,7 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
           typename CacheInput>
 __launch_bounds__(128) __global__ void gqa_attention_small_t_simt_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    __half* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
@@ -174,7 +175,8 @@ __launch_bounds__(128) __global__ void gqa_attention_small_t_simt_partial_bf16_k
                 const std::int64_t cache_off =
                     gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
                 store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
-                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+                store_vec(&cache_v[cache_off],
+                          bf16x8_bits_to_f16x8_bits(load_vec<int4>(&input.v[new_off])));
             }
         }
     }
@@ -209,13 +211,9 @@ __launch_bounds__(128) __global__ void gqa_attention_small_t_simt_partial_bf16_k
         return cache_k +
                gqa_cache_index<Geometry>(physical_page, kv_head, 0, key & kPagedKVPageMask);
     };
-    const auto resolve_v = [&](int key, int physical_page) -> const __nv_bfloat16* {
-        if constexpr (CacheInput::writes_cache) {
-            const int new_token = key - first_pos;
-            if (new_token >= 0 && new_token < valid_tokens) {
-                return input.v + gqa_kv_new_index<Geometry>(kv_head, 0, new_token);
-            }
-        }
+    // fp16 V: new tokens were converted into cache_v by the append phase above
+    // (same split range, __syncthreads), so V always resolves from the cache.
+    const auto resolve_v = [&](int key, int physical_page) -> const __half* {
         return cache_v +
                gqa_cache_index<Geometry>(physical_page, kv_head, 0, key & kPagedKVPageMask);
     };
@@ -277,12 +275,11 @@ __launch_bounds__(128) __global__ void gqa_attention_small_t_simt_partial_bf16_k
                 const float pj = __shfl_sync(FullMask, p, j);
                 if (pj == 0.0f) { continue; }
                 const int keyj             = k0 + j;
-                const __nv_bfloat16* v_row = resolve_v(keyj, physical_page);
-                const __nv_bfloat162* v_pair =
-                    reinterpret_cast<const __nv_bfloat162*>(v_row + lane * DPerLane);
+                const __half* v_row  = resolve_v(keyj, physical_page);
+                const __half2* v_pair = reinterpret_cast<const __half2*>(v_row + lane * DPerLane);
 #pragma unroll
                 for (int e2 = 0; e2 < DPerLane / 2; ++e2) {
-                    const float2 vf = __bfloat1622float2(v_pair[e2]);
+                    const float2 vf = __half22float2(v_pair[e2]);
                     acc[2 * e2]     = fmaf(pj, vf.x, acc[2 * e2]);
                     acc[2 * e2 + 1] = fmaf(pj, vf.y, acc[2 * e2 + 1]);
                 }

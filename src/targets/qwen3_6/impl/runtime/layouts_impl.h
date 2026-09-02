@@ -165,7 +165,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .planes =
                     {
                         {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        {DType::FP16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
                     },
             };
             dflash.full = qwen3_6::PagedKVCacheLayout{

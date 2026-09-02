@@ -44,7 +44,7 @@ std::uint32_t validate_context(const PagedKVBatchLayerView& context, const char*
         context.block_tables.ne[0] <= 0 || context.block_tables.ne[1] <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid context capacity");
     }
-    if (context.k_pages.dtype != DType::BF16 || context.v_pages.dtype != DType::BF16) {
+    if (context.k_pages.dtype != DType::BF16 || context.v_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": context K/V must be BF16");
     }
     require_shape(context.k_pages, kHeadDim, kPagedKVPageSize, physical_pages, kKVHeads, op,

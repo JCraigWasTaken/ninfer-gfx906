@@ -49,6 +49,25 @@ __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
 
 #endif // NINFER_GFX906_COMPAT
 
+// fp16 V storage (upstream 21a0e85f): V is stored as FP16_RNE(BF16 input).
+// gfx906 port: bf16 -> f32 is an exact shift, f32 -> f16 uses the HIP RNE pack.
+__device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
+    const __half2 packed = __floats2half2_rn(lo, hi);
+    return load_vec<std::uint32_t>(&packed);
+}
+
+__device__ __forceinline__ std::uint32_t bf16x2_bits_to_f16x2_bits(std::uint32_t bits) {
+    return pack_f16x2(__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u));
+}
+
+__device__ __forceinline__ int4 bf16x8_bits_to_f16x8_bits(int4 bits) {
+    return make_int4(
+        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.x))),
+        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.y))),
+        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.z))),
+        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.w))));
+}
+
 __device__ __forceinline__ float2 bf16x2_to_float2(__nv_bfloat162 value) {
     return __bfloat1622float2(value);
 }

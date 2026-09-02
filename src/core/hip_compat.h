@@ -17,6 +17,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
+
 #if !defined(__HIP_PLATFORM_AMD__)
 #error "The gfx906 port supports only AMD HIP targets"
 #endif
@@ -91,7 +93,20 @@
 
 // CUDA-12 flag-style instantiate maps to hipGraphInstantiateWithFlags; the
 // legacy hipGraphInstantiate signature takes error-node/log-buffer arguments.
-#define cudaGraphInstantiate hipGraphInstantiateWithFlags
+// Test tooling also uses the CUDA-11 five-argument form (error node, log buffer,
+// buffer size), which is HIP's legacy hipGraphInstantiate signature.
+inline hipError_t ninfer_hip_graph_instantiate(hipGraphExec_t* exec, hipGraph_t graph,
+                                               unsigned long long flags) {
+    return hipGraphInstantiateWithFlags(exec, graph, flags);
+}
+inline hipError_t ninfer_hip_graph_instantiate(hipGraphExec_t* exec, hipGraph_t graph,
+                                               hipGraphNode_t* error_node, char* log_buffer,
+                                               std::size_t buffer_size) {
+    return hipGraphInstantiate(exec, graph, error_node, log_buffer, buffer_size);
+}
+#define cudaGraphInstantiate ninfer_hip_graph_instantiate
+#define cudaStreamCreate hipStreamCreate
+#define cudaStreamCaptureModeGlobal hipStreamCaptureModeGlobal
 
 // CUDA 12 reports graph-exec update results through a result-info struct; HIP
 // keeps the CUDA 11 (error node + result enum) signature. Adapt.

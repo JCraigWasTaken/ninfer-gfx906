@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include "ops/common/math.cuh"
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -14,7 +17,7 @@ inline constexpr int kKVCacheAppendPrefixPage    = 64;
 
 __device__ __forceinline__ void kv_cache_append_prefix_copy_cyclic_unit(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    __nv_bfloat16* __restrict__ cache_k, __nv_bfloat16* __restrict__ cache_v, int token,
+    __nv_bfloat16* __restrict__ cache_k, __half* __restrict__ cache_v, int token,
     int unit_in_token, int slot, int padded_capacity) {
     constexpr int Bf16PerUnit  = 16;
     constexpr int UnitsPerHead = kKVCacheAppendPrefixHeadDim / Bf16PerUnit;
@@ -30,16 +33,16 @@ __device__ __forceinline__ void kv_cache_append_prefix_copy_cyclic_unit(
     const int4 k0                               = *reinterpret_cast<const int4*>(&k[src]);
     const int4 v0                               = *reinterpret_cast<const int4*>(&v[src]);
     *reinterpret_cast<int4*>(&cache_k[dst])     = k0;
-    *reinterpret_cast<int4*>(&cache_v[dst])     = v0;
+    *reinterpret_cast<int4*>(&cache_v[dst])     = bf16x8_bits_to_f16x8_bits(v0);
     const int4 k1                               = *reinterpret_cast<const int4*>(&k[src + 8]);
     const int4 v1                               = *reinterpret_cast<const int4*>(&v[src + 8]);
     *reinterpret_cast<int4*>(&cache_k[dst + 8]) = k1;
-    *reinterpret_cast<int4*>(&cache_v[dst + 8]) = v1;
+    *reinterpret_cast<int4*>(&cache_v[dst + 8]) = bf16x8_bits_to_f16x8_bits(v1);
 }
 
 __device__ __forceinline__ void kv_cache_append_prefix_copy_paged_unit(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    __nv_bfloat16* __restrict__ cache_k, __nv_bfloat16* __restrict__ cache_v, int token,
+    __nv_bfloat16* __restrict__ cache_k, __half* __restrict__ cache_v, int token,
     int unit_in_token, int page_offset, int physical_page, int physical_pages) {
     constexpr int Bf16PerUnit  = 16;
     constexpr int UnitsPerHead = kKVCacheAppendPrefixHeadDim / Bf16PerUnit;
@@ -56,18 +59,18 @@ __device__ __forceinline__ void kv_cache_append_prefix_copy_paged_unit(
     const int4 k0                               = *reinterpret_cast<const int4*>(&k[src]);
     const int4 v0                               = *reinterpret_cast<const int4*>(&v[src]);
     *reinterpret_cast<int4*>(&cache_k[dst])     = k0;
-    *reinterpret_cast<int4*>(&cache_v[dst])     = v0;
+    *reinterpret_cast<int4*>(&cache_v[dst])     = bf16x8_bits_to_f16x8_bits(v0);
     const int4 k1                               = *reinterpret_cast<const int4*>(&k[src + 8]);
     const int4 v1                               = *reinterpret_cast<const int4*>(&v[src + 8]);
     *reinterpret_cast<int4*>(&cache_k[dst + 8]) = k1;
-    *reinterpret_cast<int4*>(&cache_v[dst + 8]) = v1;
+    *reinterpret_cast<int4*>(&cache_v[dst + 8]) = bf16x8_bits_to_f16x8_bits(v1);
 }
 
 __global__ void kv_cache_append_prefix_cyclic_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int32_t* __restrict__ lanes, __nv_bfloat16* __restrict__ cache_k,
-    __nv_bfloat16* __restrict__ cache_v, int min_count, int max_count, int width,
+    __half* __restrict__ cache_v, int min_count, int max_count, int width,
     int padded_capacity) {
     constexpr int UnitsPerToken  = kKVCacheAppendPrefixHeads * 8;
     constexpr int TokensPerBlock = 256 / UnitsPerToken;
@@ -102,7 +105,7 @@ __global__ void kv_cache_append_prefix_paged_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int32_t* __restrict__ table_rows, __nv_bfloat16* __restrict__ cache_k,
-    __nv_bfloat16* __restrict__ cache_v, const std::int32_t* __restrict__ block_tables,
+    __half* __restrict__ cache_v, const std::int32_t* __restrict__ block_tables,
     int physical_pages, int logical_pages, int min_count, int max_count, int width) {
     constexpr int UnitsPerToken  = kKVCacheAppendPrefixHeads * 8;
     constexpr int TokensPerBlock = 256 / UnitsPerToken;

@@ -32,6 +32,7 @@
 // page lookup per tile suffices.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
@@ -49,7 +50,7 @@ template <typename Geometry, typename Metadata>
 __launch_bounds__(kGqaPrefillSimtThreads) __global__
     void gqa_attention_prefill_simt_bf16_kernel(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ cache_k,
-        const __nv_bfloat16* __restrict__ cache_v, Metadata metadata,
+        const __half* __restrict__ cache_v, Metadata metadata,
         const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
         std::int32_t width) {
     constexpr int D           = kGqaPrefillHeadDim;     // 256
@@ -69,7 +70,7 @@ __launch_bounds__(kGqaPrefillSimtThreads) __global__
 
     __shared__ __align__(16) __nv_bfloat16 q_s[Br * DP];
     __shared__ __align__(16) __nv_bfloat16 k_s[Bc * DP];
-    __shared__ __align__(16) __nv_bfloat16 v_s[Bc * DP];
+    __shared__ __align__(16) __half v_s[Bc * DP];
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -130,8 +131,8 @@ __launch_bounds__(kGqaPrefillSimtThreads) __global__
             const std::int64_t src = tile_base + static_cast<std::int64_t>(key_l) * D + d;
             *reinterpret_cast<__nv_bfloat162*>(&k_s[key_l * DP + d]) =
                 *reinterpret_cast<const __nv_bfloat162*>(&cache_k[src]);
-            *reinterpret_cast<__nv_bfloat162*>(&v_s[key_l * DP + d]) =
-                *reinterpret_cast<const __nv_bfloat162*>(&cache_v[src]);
+            *reinterpret_cast<__half2*>(&v_s[key_l * DP + d]) =
+                *reinterpret_cast<const __half2*>(&cache_v[src]);
         }
         __syncthreads();
 
@@ -183,11 +184,11 @@ __launch_bounds__(kGqaPrefillSimtThreads) __global__
             for (int j = 0; j < Bc; ++j) {
                 const float pj = __shfl_sync(FullMask, p, j);
                 if (pj == 0.0f) { continue; }
-                const __nv_bfloat162* v_pair =
-                    reinterpret_cast<const __nv_bfloat162*>(&v_s[j * DP + lane * DPerLane]);
+                const __half2* v_pair =
+                    reinterpret_cast<const __half2*>(&v_s[j * DP + lane * DPerLane]);
 #pragma unroll
                 for (int e2 = 0; e2 < DPerLane / 2; ++e2) {
-                    const float2 vf     = __bfloat1622float2(v_pair[e2]);
+                    const float2 vf     = __half22float2(v_pair[e2]);
                     acc[r_local][2 * e2]     = fmaf(pj, vf.x, acc[r_local][2 * e2]);
                     acc[r_local][2 * e2 + 1] = fmaf(pj, vf.y, acc[r_local][2 * e2 + 1]);
                 }

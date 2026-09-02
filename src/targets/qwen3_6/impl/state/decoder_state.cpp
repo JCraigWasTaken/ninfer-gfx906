@@ -38,7 +38,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * (quantized ? 4ULL : 2ULL));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
-        pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
+        // fp16 V storage (upstream 21a0e85f): bf16 caches keep K bf16 and store V fp16.
+        pool_spec.planes.push_back({quantized ? dtype : DType::FP16, head_dim, kv_heads, 256});
         if (quantized) {
             pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
             pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});

@@ -5,6 +5,7 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 #include <cstdint>
@@ -112,7 +113,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_state,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ selectors,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int context_stride, int logical_pages,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
@@ -316,8 +317,12 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         cp_wait<0>();
         __syncthreads();
 
+        // gfx906 port: fp16 V storage is staged bit-for-bit here. This tensor-core
+        // dflash kernel is not used on gfx906; upstream 21a0e85f converts the query V
+        // tile to fp16 and runs PV with mma_f16, which is NOT mirrored in this kernel.
         bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
-            v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
+            v_s, reinterpret_cast<const __nv_bfloat16*>(context_v), query_v, current_key0,
+            current_valid, current_is_query, kv_head,
             context_stride, current_page, tid);
         cp_commit();
 
@@ -524,7 +529,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int physical_pages, int logical_pages,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
@@ -539,7 +544,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
     int padded_context, int max_context, int split_capacity, float scale,
     __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
     float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {

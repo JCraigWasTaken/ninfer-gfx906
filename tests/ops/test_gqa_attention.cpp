@@ -304,6 +304,12 @@ float f16_bits_to_f32(std::uint16_t bits) {
     return negative ? -magnitude : magnitude;
 }
 
+std::vector<std::uint16_t> to_f16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_f16_bits(values[i]); }
+    return bits;
+}
+
 std::int32_t round_even_to_i32(float value) {
     const float lower_f  = std::floor(value);
     const float fraction = value - lower_f;
@@ -359,7 +365,7 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
     HostCache cache{geometry, dtype, max_context, logical_capacity};
     if (dtype == DType::BF16) {
         cache.k_bf16 = to_bf16_bits(logical_k);
-        cache.v_bf16 = to_bf16_bits(logical_v);
+        cache.v_bf16 = to_f16_bits(logical_v); // fp16 V storage (bits vector keeps its name)
         return cache;
     }
 
@@ -395,7 +401,7 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                     const std::size_t target =
                         cache_index(geometry, cache.logical_capacity, head, position, d);
                     cache.k_bf16[target] = f32_to_bf16(k[source]);
-                    cache.v_bf16[target] = f32_to_bf16(v[source]);
+                    cache.v_bf16[target] = f32_to_f16_bits(v[source]); // fp16 V (upstream reference)
                 }
                 continue;
             }
@@ -418,7 +424,8 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
                    std::int32_t d) {
     const std::size_t code = cache_index(cache.geometry, cache.logical_capacity, head, position, d);
     if (cache.dtype == DType::BF16) {
-        return static_cast<double>(bf16_to_f32(key ? cache.k_bf16[code] : cache.v_bf16[code]));
+        return static_cast<double>(key ? bf16_to_f32(cache.k_bf16[code])
+                                       : f16_bits_to_f32(cache.v_bf16[code]));
     }
 
     const std::size_t scale =
@@ -540,7 +547,7 @@ public:
         PagedKVLayerView result;
         result.k_pages      = Tensor(k_.data(), dtype_,
                                      {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-        result.v_pages      = Tensor(v_.data(), dtype_,
+        result.v_pages      = Tensor(v_.data(), dtype_ == DType::BF16 ? DType::FP16 : dtype_,
                                      {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.block_table  = Tensor(block_table_.data(), DType::I32, {logical_pages_});
         result.num_kv_heads = geometry_.kv_heads;
@@ -676,7 +683,7 @@ public:
         PagedKVBatchLayerView result;
         result.k_pages      = Tensor(k_.data(), dtype_,
                                      {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-        result.v_pages      = Tensor(v_.data(), dtype_,
+        result.v_pages      = Tensor(v_.data(), dtype_ == DType::BF16 ? DType::FP16 : dtype_,
                                      {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.block_tables = Tensor(block_tables_.data(), DType::I32,
                                      {logical_pages_, static_cast<std::int32_t>(rows_)});
