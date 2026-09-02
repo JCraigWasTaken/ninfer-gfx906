@@ -203,3 +203,19 @@ dtype. Fine.
 Critical files: PORT src/core/hip_compat.h; DONOR src/ops/common/allreduce.cu; PORT src/ops/linear/q5/q5_dispatch.cpp
 (pattern for all five dispatch merges); DONOR src/targets/qwen3_6/impl/runtime/text_context_impl.h; PORT
 src/targets/qwen3_6/impl/runtime/layouts_impl.h.
+
+S8 (diagnosis, 2026-09-02) - why the dual-device graph replays at 0.21 t/s. tools/tp2/replay_probe.cu (ninfer_tp2_replay_probe)
+   times two-device graphs of 4..1500 nodes in seven shapes: every shape replays at 1-10 us per node, so neither per-node
+   host serialisation, host-staged memcpy nodes nor a fixed launch cost explains 4.7 s. NINFER_GFX906_GRAPH_TRACE=1
+   (src/core/decode_graph.cpp) on the real graph: 2000 nodes (1737 kernel, 263 memcpy), hipGraphLaunch 2-3 ms, device
+   4.72 s. rocprofv3 of the same run: during replay EVERY dispatch is on device 0, on two queues; rank 1's GEMVs take
+   100-300x longer there (q4_swiglu_pair_gemv 88 us vs 28 ms) because they read rank 1's weights over PCIe through the
+   UVA peer mapping. ROCm 6.4.1's graph executor creates its parallel-branch streams on the LAUNCH device and ignores
+   the nodes' capture device; output is correct, time is PCIe bandwidth. The probe shows the same agent split under
+   rocprof (dual-* shapes 99 % on device 0), invisible at 16 KB working sets. Consequence: the single-graph
+   DecodeGraphPeerBridge design cannot work on this runtime; two captures bridged by events are rejected by HIP
+   (the cross-capture wait is accepted, the next cross-device memcpy/kernel is hipErrorInvalidValue, the stream is
+   poisoned). Fix design for S9: two per-device graphs launched on their own streams, all-reduce synchronised on device
+   memory (signal kernel P2P-writes a sequence into the peer's flag, spin-wait kernel, peer-read copy kernel, combine),
+   knob NINFER_GFX906_TP2_FLAG_SYNC. Until then tp2 runs eager (--no-cuda-graph, 31.93 t/s); treat tp2 graphs-on as
+   broken on ROCm 6.4.1. Full note: ~/ninfer-work/stage10/tp2-s8-diagnosis.md; RESULT TP2-S8 in ~/EXPERIMENTS.md.
