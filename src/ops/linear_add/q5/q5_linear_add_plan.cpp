@@ -211,6 +211,14 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
 #endif
         return;
     case Q5LinearAddScheduleId::TiledResidualGfx906:
+#if defined(NINFER_GFX906_COMPAT)
+        // Pass 2e: T=2..5 (the MTP verify widths) take the register-resident
+        // small-T GEMV; NINFER_GFX906_PASS2_SMALLT=0 keeps the tiled GEMM.
+        if (gfx906_pass2_smallt_enabled() &&
+            q5_linear_add_gemv_smallt_gfx906_launch(x, w, residual_out, stream)) {
+            return;
+        }
+#endif
         q5_linear_add_tiled_gfx906_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C16:

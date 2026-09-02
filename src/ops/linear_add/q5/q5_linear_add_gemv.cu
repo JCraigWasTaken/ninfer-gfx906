@@ -64,4 +64,37 @@ void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
+#if defined(NINFER_GFX906_COMPAT)
+// Pass 2e: small-T (2..5) variant of the two residual GEMVs above. Same chunk
+// streams as T=1; x is T token rows staged per K-slab in LDS (<= 32 KB), T
+// accumulators per lane, residual read from out[t * out_ld + row].
+constexpr int kQ5AddSmallTThreadsGfx906 = 512;
+constexpr int kQ5AddSmallTLdsCapGfx906  = 32768;
+
+bool q5_linear_add_gemv_smallt_gfx906_launch(const Tensor& x, const Weight& w,
+                                             Tensor& residual_out, cudaStream_t stream) {
+    const int t = x.ne[1];
+    if (t < 2 || t > 5) { return false; }
+    const auto* xp     = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* high   = static_cast<const std::uint8_t*>(w.qhigh);
+    const auto* scales = static_cast<const std::uint8_t*>(w.scales);
+    auto* out          = static_cast<__nv_bfloat16*>(residual_out.data);
+    const int x_ld     = static_cast<int>(x.nb[1] / sizeof(__nv_bfloat16));
+    const int out_ld   = static_cast<int>(residual_out.nb[1] / sizeof(__nv_bfloat16));
+    bool launched      = false;
+    if (w.n == 5120 && w.k == 6144 && w.padded_shape[1] == 6144) {
+        launched = q5_gemv_smallt_gfx906_dispatch<5120, 6144, true, kQ5AddSmallTThreadsGfx906,
+                                                  kQ5AddSmallTLdsCapGfx906>(
+            t, xp, x_ld, codes, high, scales, out, out_ld, stream);
+    } else if (w.n == 5120 && w.k == 17408 && w.padded_shape[1] == 17408) {
+        launched = q5_gemv_smallt_gfx906_dispatch<5120, 17408, true, kQ5AddSmallTThreadsGfx906,
+                                                  kQ5AddSmallTLdsCapGfx906>(
+            t, xp, x_ld, codes, high, scales, out, out_ld, stream);
+    }
+    if (launched) { CUDA_CHECK(cudaGetLastError()); }
+    return launched;
+}
+#endif
+
 } // namespace ninfer::ops::detail
