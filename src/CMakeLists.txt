@@ -91,6 +91,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
   ops/launcher/vision_attention.cu
+  ops/launcher/target_logprobs.cu
   ops/launcher/vision_pos_embed.cu
   # Gated DeltaNet Linear Attention core.
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
@@ -266,6 +267,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
+  ops/wrapper/target_logprobs.cpp
   ops/wrapper/vision_pos_embed.cpp)
 
 # gfx906 has no FP8/NVFP4 units and the 27B target is dense, so the fp8/,
