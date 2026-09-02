@@ -8,6 +8,7 @@
 #include "core/layout.h"
 #include "core/tensor.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
+#include <ninfer/targets/qwen3_6/mtp_lookup_gate.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
 
@@ -37,6 +38,7 @@ struct DFlashPersistentLayout {
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     std::optional<GdnReplayRecordLayout> replay_records;
+    std::optional<GdnReplayRecordLayout> mtp_lookup_replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;

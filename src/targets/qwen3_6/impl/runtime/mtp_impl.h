@@ -179,16 +179,22 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     }
 }
 
-auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
+                           std::uint32_t verify_k, std::uint32_t proposal_k,
                            MtpGqaEnvelopes envelopes) {
-    return [&state, batch_size, k, envelopes] {
+    return [&state, batch_size, verify_k, proposal_k, envelopes] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
-            k == 0 || k > kMtpDecodeMaximumDrafts) {
+            verify_k == 0 || verify_k > kMtpLookupMaximumDrafts || proposal_k == 0 ||
+            proposal_k > kMtpDecodeMaximumDrafts || proposal_k > verify_k) {
             throw std::logic_error("MTP decode batch state is incomplete");
         }
 
         qwen3_6::MtpDecodeState& frame = state.frame;
-        const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
+        const std::int32_t width       = static_cast<std::int32_t>(verify_k) + 1;
+        // Which of the two MTP verify frames this round is running. The context-lookup frame
+        // verifies fifteen drafts and the ordinary frame at most five (draft_window never reaches
+        // fifteen), so the width alone identifies it, and rank 1 must pick the same one.
+        const bool lookup_round = verify_k == kMtpLookupMaximumDrafts;
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
@@ -199,7 +205,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             // count, the next round's AR positions -- is DERIVED from it by the same deterministic
             // Ops, run again on device 1, rather than transferred: the only other inputs are the
             // gathered logits, which are bit-identical on both ranks.
-            if (!tp->io->mtp_decode.has_value()) {
+            if (!tp->io->mtp_decode.has_value() ||
+                (lookup_round && !tp->io->mtp_lookup_decode.has_value())) {
                 throw std::logic_error("tensor-parallel MTP decode requires a peer frame");
             }
             // Rank 1 uploads ITS OWN ingress record, not rank 0's. The two differ in exactly one
@@ -215,7 +222,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             }
             const CurrentDevice restore;
             CUDA_CHECK(cudaSetDevice(tp->device->device));
-            CUDA_CHECK(cudaMemcpyAsync(tp->io->mtp_decode->ingress.data, peer_ingress,
+            qwen3_6::MtpDecodeState& peer_frame =
+                lookup_round ? *tp->io->mtp_lookup_decode : *tp->io->mtp_decode;
+            CUDA_CHECK(cudaMemcpyAsync(peer_frame.ingress.data, peer_ingress,
                                        sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                        tp->device->stream));
         }
@@ -241,6 +250,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                         v.budgets, v.licensed_counts, v.rope_deltas,
                                         v.alignment_ids, v.next_extents, v.ar_positions,
                                         v.ar_rope_positions, v.ar_valid_columns,
+                                        static_cast<std::int32_t>(proposal_k),
                                         static_cast<std::int32_t>(state.text_cache.max_context()),
                                         state.execution.device.stream);
             card.mtp_forward_decode_batch(v.alignment_ids, v.target_hidden, v.target_positions,
@@ -251,7 +261,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
             Tensor draft0 = v.next_drafts.slice(1, 0, 1).view({batch_size});
             card.mtp_propose_batch(v.ar_hidden, v.proposal_logits, draft0);
-            for (std::uint32_t step = 0; step + 1 < k; ++step) {
+            for (std::uint32_t step = 0; step + 1 < proposal_k; ++step) {
                 Tensor previous =
                     v.next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
                 Tensor next = v.next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1)
@@ -275,7 +285,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             }
         } else {
             const ExecutionContext& ec = *tp->execution;
-            MtpRoundView p         = slice_mtp_frame(*tp->io->mtp_decode, batch_size);
+            MtpRoundView p = slice_mtp_frame(
+                lookup_round ? *tp->io->mtp_lookup_decode : *tp->io->mtp_decode, batch_size);
             MtpRoundView* views[2] = {&v, &p};
             for_each_rank(ec, [&](int rank) {
                 MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
@@ -285,13 +296,16 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             });
             target_verify_accept(state.execution, state.continuation_hidden_store, card,
                                  verify_view(v, state.execution.replay_records),
-                                 verify_view(p, tp->replay_records), envelopes.target_verify);
+                                 verify_view(p, lookup_round ? tp->mtp_lookup_replay_records
+                                                             : tp->replay_records),
+                                 envelopes.target_verify);
             for_each_rank(ec, [&](int rank) {
                 MtpRoundView& r = *views[static_cast<std::size_t>(rank)];
                 ops::mtp_prepare_next_round(
                     r.verify_ids, r.anchors, r.accepted, r.frontiers, r.budgets, r.licensed_counts,
                     r.rope_deltas, r.alignment_ids, r.next_extents, r.ar_positions,
                     r.ar_rope_positions, r.ar_valid_columns,
+                    static_cast<std::int32_t>(proposal_k),
                     static_cast<std::int32_t>(state.text_cache.max_context()),
                     ec.dev[rank]->stream);
             });
@@ -310,7 +324,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             const std::array<Tensor, 2> proposal_logits = {v.proposal_logits, p.proposal_logits};
             Tensor draft0 = v.next_drafts.slice(1, 0, 1).view({batch_size});
             card.mtp_propose_batch({v.ar_hidden, p.ar_hidden}, proposal_logits, draft0);
-            for (std::uint32_t step = 0; step + 1 < k; ++step) {
+            for (std::uint32_t step = 0; step + 1 < proposal_k; ++step) {
                 Tensor previous =
                     v.next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
                 Tensor next = v.next_drafts.slice(1, static_cast<std::int32_t>(step + 1), 1)
@@ -352,15 +366,17 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
     };
 }
 
-void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size,
+                              std::uint32_t verify_k, std::uint32_t proposal_k,
                               MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+    auto body = mtp_decode_batch_body(state, batch_size, verify_k, proposal_k, envelopes);
     capture_graph(state, definition, body);
 }
 
-void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t verify_k,
+                      std::uint32_t proposal_k, MtpGqaEnvelopes envelopes,
+                      DecodeGraphExecutable* executable) {
+    auto body = mtp_decode_batch_body(state, batch_size, verify_k, proposal_k, envelopes);
     run_prepared(state, executable, body);
 }
 

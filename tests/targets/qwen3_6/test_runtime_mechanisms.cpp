@@ -2,6 +2,7 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/mtp_alignment.h>
+#include <ninfer/targets/qwen3_6/mtp_lookup_gate.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
@@ -128,6 +129,17 @@ void test_round_layout() {
     expect(round.mtp_decode.has_value() && round.mtp_decode->alignment_ids.shape[0] == 6 &&
                round.mtp_decode->alignment_ids.shape[1] == 1,
            "MTP decode frame is explicit");
+    // The wider frame is planned only when the context-lookup path is enabled, so the
+    // expectation follows the same gate the layout does.
+    if (q36::mtp_context_lookup_enabled()) {
+        expect(round.mtp_lookup_decode.has_value() &&
+                   round.mtp_lookup_decode->alignment_ids.shape[0] == 16 &&
+                   round.mtp_lookup_decode->ar_positions.shape[1] == 4,
+               "MTP lookup frame verifies fifteen tokens but proposes five");
+    } else {
+        expect(!round.mtp_lookup_decode.has_value(),
+               "MTP lookup frame is absent when the context-lookup path is off");
+    }
 
     ninfer::LayoutBuilder speculative_builder;
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(
@@ -141,7 +153,8 @@ void test_round_layout() {
                dflash.dflash_decode.has_value() &&
                dflash.dflash_decode->draft_tokens.shape[0] == 15,
            "K=15 DFlash storage is backend-owned");
-    expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value(),
+    expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value() &&
+               !dflash.mtp_lookup_decode.has_value(),
            "DFlash layout does not allocate MTP storage");
 }
 

@@ -131,6 +131,20 @@ use MTP with three draft tokens and DFlash with seven draft tokens (block length
 the optimized proposal head. DFlash accepts up to fifteen draft tokens; seven is the current
 measured recommendation rather than a semantic limit.
 
+MTP can also perform lossless context lookup. When the latest 16 generated or prompt tokens
+exactly match an earlier occurrence, the runtime proposes that occurrence's continuation. It
+verifies up to fifteen tokens only when the lookup's first five tokens agree with the learned MTP
+proposal; otherwise it stays on the configured one-to-five-token MTP window. A concurrent decode
+batch uses the longer topology only when every active row qualifies. There is no artifact or
+sampling change on this path.
+
+Upstream ships context lookup always on. This gfx906 port keeps it **off by default** and gates it
+on the environment variable `NINFER_GFX906_MTP_LOOKUP=1`, so the donor-parity gate still runs on
+the unchanged five-token MTP round, and so the second verify frame, the second GDN replay-record
+plane, and the second captured graph family cost nothing unless the path is asked for. The
+variable is read once at startup; setting it after the runtime is built has no effect. There is no
+CLI option.
+
 ## Common options
 
 | Option | Meaning | Default |

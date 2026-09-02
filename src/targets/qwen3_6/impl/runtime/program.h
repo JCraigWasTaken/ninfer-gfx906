@@ -108,6 +108,7 @@ struct PendingCandidate {
     std::uint32_t base_S        = 0;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
+    std::uint32_t row_stride    = 1;
 };
 
 enum class Lifecycle : std::uint8_t {
@@ -228,6 +229,8 @@ struct PeerRuntime {
     // head/channel shard and folds it here, so the two devices commit the same accepted prefix
     // from records neither ever exchanges.
     std::optional<GdnReplayRecords> replay_records;
+    // Rank 1's mirror of the wider context-lookup replay records; same shard geometry, 16 columns.
+    std::optional<GdnReplayRecords> mtp_lookup_replay_records;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     // Rank 1's OWN penalty counters. `ops::SamplingConfig::token_counts` is a raw device pointer,
@@ -319,6 +322,9 @@ public:
     std::optional<schedule::TpPeerCore> peer_core;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
+    // Second GDN replay-record plane, sized for the 16-column context-lookup verify frame. Only
+    // present with the MTP backend; the ordinary five-column round keeps using `replay_records`.
+    std::optional<GdnReplayRecords> mtp_lookup_replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
@@ -332,6 +338,7 @@ public:
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
+    DecodeGraphFamily mtp_lookup_graphs;
     DecodeGraphFamily dflash_graphs;
 
     PinnedHostBuffer round_host;
@@ -423,7 +430,9 @@ private:
     void publish_peer_ordinary_ingress();
     // Debug-only: reads rank 1's MTP egress back and compares it, field for field, with rank 0's.
     // No-op unless the check is enabled and a peer exists.
-    void check_peer_mtp_egress(std::size_t rows);
+    // `width` is the round's verification width (verify drafts + 1), which selects both the
+    // peer frame the egress is read from and the licensed-token row stride.
+    void check_peer_mtp_egress(std::size_t rows, std::uint32_t width);
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);

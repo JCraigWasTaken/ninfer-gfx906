@@ -71,6 +71,9 @@ struct TpPeerCore {
     // Present only when the sequence plan enables MTP.
     const qwen3_6::PagedKVCache* mtp_cache  = nullptr;
     const GdnReplayRecords* replay_records  = nullptr;
+    // Rank 1's wider replay-record plane for the context-lookup verify frame. Null when the
+    // context-lookup path is off.
+    const GdnReplayRecords* mtp_lookup_replay_records = nullptr;
     // Rank 1's own pinned MTP ingress record (see PeerRuntime::token_counts). It differs from
     // rank 0's only in the per-row `sampling[row].token_counts` pointer, which must name rank 1's
     // counter lane: `speculative_accept_greedy_drafts` READS and atomically WRITES that pointer
@@ -259,10 +262,12 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
 // different current and next proposal extent while the model traversal remains batched.
-void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size,
+                              std::uint32_t verify_k, std::uint32_t proposal_k,
                               MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition);
-void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable);
+void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t verify_k,
+                      std::uint32_t proposal_k, MtpGqaEnvelopes envelopes,
+                      DecodeGraphExecutable* executable);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
