@@ -274,6 +274,8 @@ std::string usage_text(std::string_view program) {
         << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
+        << "  --tp <1|2>                  tensor-parallel ranks (default: 1; 2 requires --devices)\n"
+        << "  --devices <id,id>           one device id per tp rank (default: {--device})\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
@@ -333,6 +335,24 @@ BenchOptions parse_args(int argc, char** argv) {
             options.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
+        } else if (arg == "--tp") {
+            options.tp = parse_nonnegative(value("--tp"), "tp");
+            if (options.tp < 1 || options.tp > 2) { throw std::invalid_argument("--tp must be 1 or 2"); }
+        } else if (arg == "--devices") {
+            options.devices.clear();
+            const std::string list = value("--devices");
+            std::size_t start = 0;
+            while (start <= list.size()) {
+                const std::size_t comma = list.find(',', start);
+                const std::string token =
+                    list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (token.empty()) {
+                    throw std::invalid_argument("--devices must be a comma-separated list of device ids");
+                }
+                options.devices.push_back(parse_nonnegative(token, "devices"));
+                if (comma == std::string::npos) { break; }
+                start = comma + 1;
+            }
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--profile-measured") {

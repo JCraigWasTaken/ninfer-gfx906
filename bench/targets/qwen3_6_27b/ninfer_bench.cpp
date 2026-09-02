@@ -150,6 +150,8 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path = options.artifact_path;
         engine_options.device        = options.device;
+        engine_options.tp            = options.tp;
+        engine_options.devices       = options.devices;
         engine_options.max_context   = max_context;
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
         engine_options.prefill_chunk = options.prefill_chunk;

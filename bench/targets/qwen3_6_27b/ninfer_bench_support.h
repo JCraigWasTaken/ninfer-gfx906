@@ -66,6 +66,8 @@ struct BenchOptions {
     std::uint32_t mtp_draft_tokens = 0;
     ProposalHead proposal_head     = ProposalHead::Full;
     int device                     = 0;
+    int tp                         = 1;
+    std::vector<int> devices;
     bool use_cuda_graph            = true;
     bool profile_measured          = false;
     OutputFormat output            = OutputFormat::Table;
