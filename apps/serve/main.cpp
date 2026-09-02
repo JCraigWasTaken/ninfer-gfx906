@@ -85,6 +85,12 @@ int main(int argc, char** argv) {
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
                  << format_bytes(memory.cuda_graph_allowance_bytes);
+        if (memory.cuda_graph_node_count != 0) {
+            // Both figures are per device: at tp 2 one graph holds both devices' nodes and each
+            // device is checked against the same per-device allowance.
+            capacity << " graph-peer=" << format_bytes(memory.cuda_graph_peer_observed_bytes)
+                     << " graph-nodes=" << memory.cuda_graph_node_count;
+        }
         if (options.enable_vision) {
             const ninfer::MediaCacheSummary media = service.media_cache_summary();
             capacity << " media-workers=" << media.preprocess_threads

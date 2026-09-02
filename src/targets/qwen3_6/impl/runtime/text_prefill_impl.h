@@ -56,10 +56,22 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end) {
+    std::optional<TpExecution> tp = tp_execution(state.execution);
+    if (tp) {
+        // The per-sequence MTP KV window is request state, so it comes from the PrefillContext
+        // rather than from the process-lifetime peer core: the MTP prefill appends and reads
+        // through the execution view, unlike the text prefill, which drives the batch cache.
+        tp->mtp_kv = state.mtp_kv_peer;
+        if (tp->mtp_kv.valid() != state.mtp_kv.valid()) {
+            throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
+        }
+    }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.text_kv,
+                     state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     tp ? &*tp : nullptr);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -85,7 +97,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
         throw std::logic_error("DFlash staged multimodal prefill is unavailable");
     }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.text_kv,
+                     state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
@@ -140,6 +153,15 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     if (hidden.dtype != DType::BF16 || hidden.ne[0] != TextConfig::hidden || hidden.ne[1] != 1 ||
         hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
         throw std::invalid_argument("sample_from_hidden requires BF16 [hidden,1]");
+    }
+    if (state.execution.peer != nullptr) {
+        // UNREACHABLE BACKSTOP. The output head is vocabulary-split at tp2, so this bonus-token
+        // path cannot run rank 0's whole-head GEMM. It is reached only by a zero-suffix reuse
+        // plan, and `plan_request_for_lane` downgrades those to a full reset at tp2 precisely so
+        // this cannot happen during execution -- an exception here would take the executor down
+        // with it. Kept so a future planner change cannot reintroduce the case silently.
+        throw std::logic_error(
+            "tensor-parallel prefix reuse cannot sample from a restored hidden state yet");
     }
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);

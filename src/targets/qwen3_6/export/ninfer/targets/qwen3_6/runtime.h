@@ -12,6 +12,7 @@
 
 namespace ninfer {
 struct DeviceContext;
+struct ExecutionContext;
 }
 
 namespace ninfer::targets::qwen3_6 {
@@ -177,14 +178,34 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
+    // Debug-only, OFF by default: capture of the full-vocabulary logits behind the most recently
+    // sampled token, as raw BF16 bits (see ProgramImplCore::logits_capture in the impl runtime).
+    // Nothing is allocated, copied, or otherwise changed until enable_logits_capture(true) runs,
+    // so an engine that never asks for it executes exactly as before. The span is valid only
+    // immediately after the caller's own round completes on a single-lane engine, and is empty
+    // while capture is disabled. Added for the greedy tp1-vs-tp2 parity harness
+    // (tools/tp2/parity.cpp); not part of any wire-facing API.
+    [[nodiscard]] std::span<const std::uint16_t> last_round_logits_bf16() const noexcept;
+    void enable_logits_capture(bool enabled);
+
+    // Debug-only, OFF by default: after each MTP decode round at tp == 2, compare rank 1's MTP
+    // egress record with rank 0's. The ranks run the acceptance Op over bit-identical inputs, so
+    // the records are argued to agree; enabling this measures it instead. Off, execution is
+    // unchanged; on, it costs one small device-to-host copy and a host compare per round. Counters
+    // are cumulative over the Program's lifetime. No-op at tp1 or without MTP.
+    void enable_peer_egress_check(bool enabled) noexcept;
+    [[nodiscard]] std::uint64_t peer_egress_check_rounds() const noexcept;
+    [[nodiscard]] std::uint64_t peer_egress_check_mismatches() const noexcept;
+
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
+                                                      const typename V::ModelView*,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      DeviceContext&);
+                                                      ExecutionContext&);
 };
 
 template <class Variant>
@@ -192,10 +213,14 @@ template <class Variant>
 make_sequence_planner(DeviceContext& device, const EngineOptions& options,
                       typename Variant::WeightsProfile weights_profile);
 
+// `peer_model` is rank 1's own model view at tp == 2 and nullptr at tp == 1; `execution` supplies
+// the device contexts (one or two). The two must agree: a non-null peer view with a tp1 execution
+// context, or the reverse, is rejected.
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
+               const typename Variant::ModelView* peer_model,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               DeviceContext& device);
+               ExecutionContext& execution);
 
 } // namespace ninfer::targets::qwen3_6

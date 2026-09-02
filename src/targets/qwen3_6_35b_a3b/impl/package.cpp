@@ -106,10 +106,15 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 }
 
 std::unique_ptr<Package::Program>
-Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
+Package::create_program(const LoadedModel& model, SequencePlan&& plan,
+                        ExecutionContext& execution) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(
-        model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
+    if (execution.tp != 1) {
+        throw std::invalid_argument("qwen3_6_35b_a3b has no tensor-parallel execution path");
+    }
+    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime, nullptr,
+                                                   model.impl_->weights_profile, std::move(plan),
+                                                   execution);
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b

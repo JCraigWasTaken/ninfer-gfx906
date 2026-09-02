@@ -52,6 +52,33 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
+int parse_tp(const char* text) {
+    const int value = parse_nonnegative_int(text, "tp");
+    if (value != 1 && value != 2) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    }
+    return value;
+}
+
+std::vector<int> parse_devices(const char* text) {
+    std::vector<int> result;
+    const std::string_view view(text);
+    std::size_t start = 0;
+    while (start <= view.size()) {
+        const std::size_t comma = view.find(',', start);
+        const std::string_view token =
+            comma == std::string_view::npos ? view.substr(start) : view.substr(start, comma - start);
+        if (token.empty()) { throw std::invalid_argument(std::string("invalid devices: ") + text); }
+        result.push_back(parse_nonnegative_int(std::string(token).c_str(), "devices"));
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    if (result.empty() || result.size() > 2) {
+        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    }
+    return result;
+}
+
 KvCapacityPolicy parse_kv_capacity(const char* text) {
     if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
     const int value = parse_nonnegative_int(text, "kv-capacity");
@@ -66,7 +93,8 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] "
+           "[--devices N,N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
@@ -94,11 +122,25 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
-           "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
+           "       Prefix reuse is unavailable at --tp 2 with --spec mtp: the MTP bridge\n"
+           "       resumes from a retained target hidden that only the primary device\n"
+           "       holds, so such requests are prefilled again instead of resumed. The\n"
+           "       answer is unchanged; only the saving is lost.\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --tp selects the tensor-parallel degree (default 1); --tp 2 splits the model "
+           "across two GPUs and requires --devices; it supports --spec mtp but not --spec "
+           "dflash, and not --vision.\n"
+           "       --devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
+           "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
+           "primary device.\n"
+           "       --no-cuda-graph runs decode eagerly. At --tp 2 that is the same two-stream "
+           "forward pass with cross-device event synchronization, in place of one captured "
+           "cross-device graph; it is the escape hatch if capture ever misbehaves, and it "
+           "produces the same tokens.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -116,6 +158,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool device_explicit             = false;
+    bool devices_explicit            = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -208,7 +252,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
-            options.device = parse_nonnegative_int(require_value("--device"), "device");
+            options.device  = parse_nonnegative_int(require_value("--device"), "device");
+            device_explicit = true;
+        } else if (arg == "--tp") {
+            options.tp = parse_tp(require_value("--tp"));
+        } else if (arg == "--devices") {
+            options.devices  = parse_devices(require_value("--devices"));
+            devices_explicit = true;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -263,6 +313,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (devices_explicit) {
+        if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
+            throw std::invalid_argument("--devices must list exactly --tp device ids");
+        }
+        if (device_explicit && options.devices.front() != options.device) {
+            throw std::invalid_argument("--device and --devices disagree on the primary device");
+        }
+        options.device = options.devices.front();
+    } else if (options.tp == 1) {
+        options.devices = {options.device};
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

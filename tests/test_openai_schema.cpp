@@ -559,6 +559,18 @@ int test_response_serialization() {
     failures +=
         check(jr.at("choices").at(0).at("message").at("reasoning_content") == "let me think",
               "reasoning_content carried");
+
+    // Generated text can legitimately contain U+FFFD: the Engine substitutes it for a byte
+    // sequence the checkpoint's byte-level vocabulary emitted that no continuation can complete
+    // (docs/serving.md, "Execution behavior"). It is ordinary content and must survive
+    // serialization byte for byte -- in both channels.
+    const std::string replaced = "ab\xef\xbf\xbd" "cd";
+    const Json ju              = Json::parse(make_chat_completion_response(
+        "id-3", "m", 111, replaced, replaced, "stop", usage));
+    failures += check(ju.at("choices").at(0).at("message").at("content") == replaced,
+                      "replacement character round-trips through content");
+    failures += check(ju.at("choices").at(0).at("message").at("reasoning_content") == replaced,
+                      "replacement character round-trips through reasoning_content");
     return failures;
 }
 
@@ -606,6 +618,13 @@ int test_chunk_serialization() {
 
     // Reasoning deltas carry reasoning_content (not content) so clients render them
     // as a separate thinking channel.
+    // A streamed delta carrying the replacement character (see test_response_serialization).
+    const Json replaced_chunk =
+        parse_sse(make_chat_chunk_content("id", "m", 1, "\xef\xbf\xbd", false));
+    failures += check(replaced_chunk.at("choices").at(0).at("delta").at("content") ==
+                          "\xef\xbf\xbd",
+                      "replacement character round-trips through a streamed content delta");
+
     const Json reasoning = parse_sse(make_chat_chunk_reasoning("id", "m", 1, "why", false));
     failures += check(reasoning.at("choices").at(0).at("delta").at("reasoning_content") == "why",
                       "reasoning delta");

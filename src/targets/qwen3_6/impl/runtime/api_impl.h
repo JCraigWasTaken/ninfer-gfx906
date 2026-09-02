@@ -222,6 +222,31 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
+std::span<const std::uint16_t> Program<Variant>::last_round_logits_bf16() const noexcept {
+    return impl_->last_round_logits_bf16();
+}
+
+template <>
+void Program<Variant>::enable_logits_capture(bool enabled) {
+    impl_->enable_logits_capture(enabled);
+}
+
+template <>
+void Program<Variant>::enable_peer_egress_check(bool enabled) noexcept {
+    impl_->enable_peer_egress_check(enabled);
+}
+
+template <>
+std::uint64_t Program<Variant>::peer_egress_check_rounds() const noexcept {
+    return impl_->peer_egress_check_rounds();
+}
+
+template <>
+std::uint64_t Program<Variant>::peer_egress_check_mismatches() const noexcept {
+    return impl_->peer_egress_check_mismatches();
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {
@@ -231,14 +256,16 @@ SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
 
 template <>
 std::unique_ptr<Program<Variant>>
-create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
-                        SequencePlan<Variant>&& plan, DeviceContext& device) {
+create_program<Variant>(const Variant::ModelView& model, const Variant::ModelView* peer_model,
+                        Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
+                        ExecutionContext& execution) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
-    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device);
+    auto impl =
+        std::make_unique<detail::ProgramImpl<Variant>>(model, peer_model, *plan.impl_, execution);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }

@@ -468,7 +468,14 @@ std::string format_server_start_json(
                               {"upload_seconds", load.upload_seconds}};
     record["engine"]   = Json{
           {"device", options.device},
+          // Tensor-parallel width and the resolved per-rank device list. At `tp` 2 every other
+          // engine and memory field in this record is rank 0's; `devices` is what names the
+          // second GPU, so a downstream reader can tell a dual-device run from a single-device
+          // one without parsing argv. `devices` always has exactly `tp` entries.
+          {"tp", options.tp},
+          {"devices", options.devices},
           {"max_context", options.max_context},
+          {"effective_max_context", memory.effective_max_context},
           {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
           {"kv_capacity", memory.kv_capacity},
           {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
@@ -504,7 +511,13 @@ std::string format_server_start_json(
              {"kv_capacity_headroom_bytes", memory.kv_capacity_headroom_bytes},
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
+             // Both observed figures are per device and are checked against the same
+             // per-device allowance; the peer field is 0 at tp 1. `cuda_graph_node_count`
+             // is one captured decode graph's node count, roughly 2x at tp 2 because one
+             // graph holds both devices' nodes.
              {"cuda_graph_observed_bytes", memory.cuda_graph_observed_bytes},
+             {"cuda_graph_peer_observed_bytes", memory.cuda_graph_peer_observed_bytes},
+             {"cuda_graph_node_count", memory.cuda_graph_node_count},
              {"kv_payload_bytes", memory.kv_payload_bytes}};
     record["environment"] =
         Json{{"device", environment.device},

@@ -164,6 +164,21 @@ target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE hip::
 set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# TP2 slice 5: the engine's concurrent executor (host-only) and the CLI option surface.
+ninfer_add_test(ninfer_concurrent_executor_test
+  SOURCES test_concurrent_executor.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core)
+target_link_libraries(ninfer_concurrent_executor_test PRIVATE hip::host)
+target_include_directories(ninfer_concurrent_executor_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_cli_options_test
+  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
+target_link_libraries(ninfer_cli_options_test PRIVATE hip::host)
+
 # Product protocol contracts.
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp

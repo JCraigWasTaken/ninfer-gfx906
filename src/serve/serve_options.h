@@ -40,6 +40,10 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
+    int tp                                 = 1;
+    // Resolved device ids, one per tp rank. Always populated by parse_serve_options() (from
+    // --devices, or synthesized as {device} when --devices is omitted).
+    std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision      = false;

@@ -372,44 +372,79 @@ void append_delta(PublishedOutput& output, OutputChannel channel, std::string te
     }
 }
 
-std::size_t valid_utf8_prefix_size(std::string_view bytes) {
+constexpr std::string_view kReplacementCharacter = "\xef\xbf\xbd";
+
+// Incremental UTF-8 decoding of a byte-level token stream. This scan is TOTAL: it never throws.
+//
+// The checkpoint vocabulary is byte-level BPE, so a generated token carries raw bytes, not text.
+// Two consequences are ordinary, not exceptional:
+//   1. One code point can span several tokens (the "中" = E4 B8 AD triple is three tokens), so a
+//      still-completable trailing prefix must be held until the next token arrives.
+//   2. The 256-byte alphabet gives every byte value its own token, including 77 bytes that can
+//      never begin a code point. In the shipped Qwen3.8-27B vocabulary those are ids 94-123 and
+//      222-255 (the continuation bytes 0x80-0xBF), 124/125 (0xC0/0xC1) and 177-187 (0xF5-0xFF).
+//      Greedy decoding does sample them, and nothing downstream can turn a lone continuation
+//      byte into text.
+// Bytes of the second kind are replaced with U+FFFD, exactly as terminalize() already does for a
+// truncated tail. Replacement follows the Unicode 15 S3.9 "maximal subpart" recommendation: one
+// U+FFFD per ill-formed subsequence, then rescanning FROM the byte that broke the sequence -- that
+// byte is never consumed by the replacement, so it gets its own verdict (it may start a valid code
+// point, or become a second U+FFFD).
+//
+// Throwing here is not an option: this runs on the Engine worker thread inside output
+// publication, where an escaping exception fails every in-flight and queued request.
+//
+// Appends the decoded text to `out` and returns how many leading bytes of `bytes` were resolved.
+// The unresolved remainder (at most three bytes) is a well-formed incomplete prefix to hold.
+std::size_t decode_utf8_prefix(std::string_view bytes, std::string& out) {
     std::size_t offset = 0;
     while (offset < bytes.size()) {
-        const auto lead         = static_cast<unsigned char>(bytes[offset]);
-        std::size_t length      = 0;
-        std::uint32_t codepoint = 0;
-        std::uint32_t minimum   = 0;
+        const auto lead    = static_cast<unsigned char>(bytes[offset]);
+        std::size_t length = 0;
+        // Well-formedness bounds of the SECOND byte (Unicode 15 table 3-7). They are what makes
+        // overlong forms, surrogates and code points above U+10FFFF unrepresentable here, so a
+        // sequence accepted by this scan needs no separate code-point range check.
+        unsigned char low  = 0x80U;
+        unsigned char high = 0xbfU;
         if (lead <= 0x7fU) {
-            length    = 1;
-            codepoint = lead;
-        } else if (lead >= 0xc2U && lead <= 0xdfU) {
-            length    = 2;
-            codepoint = lead & 0x1fU;
-            minimum   = 0x80U;
+            out.push_back(static_cast<char>(lead));
+            ++offset;
+            continue;
+        }
+        if (lead >= 0xc2U && lead <= 0xdfU) {
+            length = 2;
         } else if (lead >= 0xe0U && lead <= 0xefU) {
-            length    = 3;
-            codepoint = lead & 0x0fU;
-            minimum   = 0x800U;
+            length = 3;
+            if (lead == 0xe0U) { low = 0xa0U; }
+            if (lead == 0xedU) { high = 0x9fU; }
         } else if (lead >= 0xf0U && lead <= 0xf4U) {
-            length    = 4;
-            codepoint = lead & 0x07U;
-            minimum   = 0x10000U;
+            length = 4;
+            if (lead == 0xf0U) { low = 0x90U; }
+            if (lead == 0xf4U) { high = 0x8fU; }
         } else {
-            throw std::invalid_argument("invalid UTF-8 leading byte in generated token stream");
+            out.append(kReplacementCharacter);
+            ++offset;
+            continue;
+        }
+
+        std::size_t index = 1;
+        bool well_formed  = true;
+        for (; index < length && offset + index < bytes.size(); ++index) {
+            const auto byte              = static_cast<unsigned char>(bytes[offset + index]);
+            const unsigned char minimum  = index == 1 ? low : 0x80U;
+            const unsigned char maximum  = index == 1 ? high : 0xbfU;
+            if (byte < minimum || byte > maximum) {
+                well_formed = false;
+                break;
+            }
+        }
+        if (!well_formed) {
+            out.append(kReplacementCharacter);
+            offset += index; // Resynchronize ON the offending byte, never past it.
+            continue;
         }
         if (offset + length > bytes.size()) { return offset; }
-        for (std::size_t index = 1; index < length; ++index) {
-            const auto byte = static_cast<unsigned char>(bytes[offset + index]);
-            if ((byte & 0xc0U) != 0x80U) {
-                throw std::invalid_argument(
-                    "invalid UTF-8 continuation byte in generated token stream");
-            }
-            codepoint = (codepoint << 6U) | (byte & 0x3fU);
-        }
-        if (codepoint < minimum || (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-            codepoint > 0x10ffffU) {
-            throw std::invalid_argument("invalid UTF-8 codepoint in generated token stream");
-        }
+        out.append(bytes.substr(offset, length));
         offset += length;
     }
     return offset;
@@ -554,10 +589,10 @@ void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& 
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
     state.utf8_pending += bytes;
-    const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
-    if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
-    state.utf8_pending.erase(0, valid);
+    std::string text;
+    const std::size_t resolved = decode_utf8_prefix(state.utf8_pending, text);
+    state.utf8_pending.erase(0, resolved);
+    if (text.empty()) { return; }
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
@@ -568,7 +603,7 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         // Publish the standard replacement character rather than an invalid
         // UTF-8 suffix; the logical token prefix remains exact.
         state.utf8_pending.clear();
-        feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
+        feed_decoded_text(state, kReplacementCharacter, policy, emitted, committed_tokens, nullptr);
     }
     if (state.in_reasoning) {
         feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,

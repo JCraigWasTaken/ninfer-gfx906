@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -126,6 +127,14 @@ struct RewriteCheckpoint {
 struct SequenceKVBundle {
     PagedKVAllocation text;
     std::optional<PagedKVAllocation> backend;
+    // Rank 1's allocation in ITS OWN text KV pool at tp == 2. The two pools have identical page
+    // geometry (only the per-page byte count differs, because rank 1 holds 2 of the 4 KV heads),
+    // and every pool operation below is issued on both in the same order, so the two allocations
+    // hold the same page ids and publish identical block tables.
+    std::optional<PagedKVAllocation> text_peer;
+    // Rank 1's allocation in ITS OWN MTP (backend) KV pool at tp == 2. Same lockstep argument as
+    // `text_peer`: identical page geometry, every pool operation issued on both in the same order.
+    std::optional<PagedKVAllocation> backend_peer;
 };
 
 struct DecodeGraphProfile {
@@ -199,10 +208,41 @@ struct RequestControl {
     std::optional<Prefill> prefill;
 };
 
+// Rank 1's complete runtime mirror: its own arenas, its own shard of the weights, its own halved
+// decoder state, and its own RoundState. It owns no bookkeeping -- lanes, page accounting,
+// sampling and the pinned host round buffers all live once, on rank 0.
+struct PeerRuntime {
+    PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer_model,
+                const SequencePlanImpl& plan);
+
+    PeerRuntime(const PeerRuntime&)            = delete;
+    PeerRuntime& operator=(const PeerRuntime&) = delete;
+
+    DeviceContext& device;
+    const LoadedModelData& model;
+    DeviceArena persistent;
+    DeviceArena workspace_storage;
+    WorkspaceArena work;
+    std::unique_ptr<qwen3_6::DecoderState> decoder;
+    // Rank 1's own GDN replay records: the speculative verify round records this device's own
+    // head/channel shard and folds it here, so the two devices commit the same accepted prefix
+    // from records neither ever exchanges.
+    std::optional<GdnReplayRecords> replay_records;
+    qwen3_6::RoundState io;
+    Tensor prefill_hidden;
+    // Rank 1's OWN penalty counters. `ops::SamplingConfig::token_counts` is a raw device pointer,
+    // and the MTP round's acceptance runs on both devices (see the replicated-accept note in
+    // mtp_impl.h), so rank 1 must never be handed rank 0's. It is not a cache: rank 0 remains the
+    // source of truth (ProgramImplCore::install_sampling zeroes both, and the one increment that
+    // happens on rank 0 alone -- prefill's bonus token -- is copied across before the first decode
+    // round), and thereafter both are advanced by the same Op over bit-identical inputs.
+    Tensor token_counts;
+};
+
 class ProgramImplCore {
 public:
-    ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device);
+    ProgramImplCore(const LoadedModelData& model, const LoadedModelData* peer_model,
+                    const SequencePlanImpl& plan, ExecutionContext& execution);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
@@ -240,7 +280,9 @@ public:
     void reset_memory_peaks() noexcept;
 
     const LoadedModelData& model;
+    ExecutionContext& execution;
     DeviceContext& device;
+    const int tp;
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
@@ -253,13 +295,28 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
+    const std::size_t gdn_state_bytes;
     const std::size_t graph_allowance_bytes;
-    std::size_t graph_observed_bytes = 0;
+    // Measured graph residency per device (index = rank). At tp1 only [0] is populated. At tp2 the
+    // single cross-device graph materializes driver state on BOTH devices, and each is checked
+    // against the SAME per-device allowance -- graph_allowance_bytes is a per-device budget, like
+    // every other field in device_reservation_bytes.
+    std::array<std::size_t, 2> graph_observed_bytes{0, 0};
+    // Node count of ONE captured decode graph (the first profile of the captured family). At tp2
+    // one graph holds both devices' nodes, so this is the direct measurement of whether the peer's
+    // half of the schedule was captured rather than left out.
+    std::size_t graph_node_count = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    const std::uint32_t effective_max_context;
+    std::optional<PeerRuntime> peer;
+    std::optional<ops::PeerEvents> peer_events;
+    // Created once at tp2 when graphs are on; forks rank 1's stream into rank 0's capture.
+    std::optional<DecodeGraphPeerBridge> graph_bridge;
+    std::optional<schedule::TpPeerCore> peer_core;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
@@ -279,27 +336,101 @@ public:
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
+    // Debug-only capture of the round's full-vocabulary logits, raw BF16 bits. OFF by default and
+    // completely inert until enable_logits_capture(true) allocates the host buffer: with it off,
+    // copy_round_logits() is a predictable branch and nothing is allocated or copied, so no
+    // production path (tp1 or tp2) is changed. With it on, the buffer is overwritten every time a
+    // token is sampled from io.logits at prefill finalization, for both tp1 and tp2 (io is rank
+    // 0's window; logits_tp2 gathers into it the same way the tp1 leaf writes it), so no
+    // tp-specific code is needed. Prefill only -- the decode path is CUDA-graph-capturable and an
+    // unconditional memcpy inside a captured region is rejected at capture time; a probe that
+    // requests exactly one output token completes on prefill's own sampled token and never runs a
+    // decode round, which is what the parity harness (tools/tp2/parity.cpp) uses. Valid only
+    // immediately after Engine::generate()/wait() returns to the calling thread for a single-lane
+    // engine -- concurrent lanes would overwrite it out of order.
+    std::vector<std::uint16_t> logits_capture;
+    bool logits_capture_enabled = false;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
+    // Rank 1's own pinned ordinary ingress: rank 0's record with every row's
+    // `sampling[row].token_counts` nulled. Rank 1 mirrors the ordinary round for its half of the
+    // weights and never samples (the output head is vocabulary-split and sampling belongs to rank
+    // 0), so the sampling configs in its frame are inert -- but they must not carry a rank-0
+    // DEVICE address into rank 1's frame: dereferencing one from rank 1 is a silent cross-device
+    // fault. A separate pinned buffer rather than a patched copy at issue time, for the same
+    // reason as `mtp_peer_host_ingress`: the upload is inside the captured decode graph, which
+    // re-reads this exact host address at every replay.
+    std::optional<PinnedHostBuffer> ordinary_peer_host;
+    qwen3_6::OrdinaryDecodeIngress* ordinary_peer_host_ingress = nullptr;
+    bool peer_egress_check_enabled     = false;
+    std::uint64_t peer_egress_rounds     = 0;
+    std::uint64_t peer_egress_mismatches = 0;
     std::optional<PinnedHostBuffer> mtp_host;
     qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
     qwen3_6::MtpDecodeEgress* mtp_host_egress   = nullptr;
+    // Rank 1's own pinned MTP ingress: byte-for-byte rank 0's record except that each row's
+    // `sampling[row].token_counts` names rank 1's counter lane. It has to be a separate pinned
+    // buffer rather than a patched copy made at issue time, because the ingress upload is inside
+    // the captured decode graph and the graph re-reads this exact host address at every replay.
+    std::optional<PinnedHostBuffer> mtp_peer_host;
+    qwen3_6::MtpDecodeIngress* mtp_peer_host_ingress = nullptr;
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
 
+    // See logits_capture's comment. Read-only; the caller owns thread-safety (single-lane, read
+    // after wait() returns). Empty while capture is disabled.
+    [[nodiscard]] std::span<const std::uint16_t> last_round_logits_bf16() const noexcept {
+        return logits_capture;
+    }
+
+    // Turns the debug capture above on or off. Enabling sizes the host buffer to the round's
+    // logits row count; disabling releases it. Must not be called while a round is in flight (the
+    // executor holds its execution mutex across this call).
+    void enable_logits_capture(bool enabled);
+
+    // Debug-only, OFF by default: after each MTP decode round at tp == 2, read rank 1's MTP egress
+    // back and compare it field for field with rank 0's. The two ranks run the acceptance Op over
+    // bit-identical inputs, so their egress records are argued to agree; enabling this turns that
+    // induction into a measurement. Costs one ~1 KiB device-to-host copy plus a host compare per
+    // round while enabled, and nothing at all while off. Counters are cumulative over the
+    // Program's lifetime; a mismatch is counted (per row, per field) rather than thrown, so a test
+    // can read the totals after a clean run.
+    void enable_peer_egress_check(bool enabled) noexcept;
+    [[nodiscard]] std::uint64_t peer_egress_check_rounds() const noexcept {
+        return peer_egress_rounds;
+    }
+    [[nodiscard]] std::uint64_t peer_egress_check_mismatches() const noexcept {
+        return peer_egress_mismatches;
+    }
+
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
+    // Copies rank 0's counter lane onto rank 1. Called once, after prefill's bonus token is
+    // sampled -- the only counter increment that happens on rank 0 and not on rank 1.
+    [[nodiscard]] static Tensor token_counts_lane(const Tensor& storage, std::uint32_t lane);
+    void publish_peer_token_counts(const SequenceState& sequence);
+    // Mirrors `mtp_host_ingress` into `mtp_peer_host_ingress`, swapping every row's counter
+    // pointer for rank 1's. No-op at tp1 or without MTP.
+    void publish_peer_mtp_ingress(std::span<const std::uint32_t> lanes);
+    // Mirrors `ordinary_host_ingress` into `ordinary_peer_host_ingress` with every row's counter
+    // pointer nulled. No-op at tp1 or without an ordinary frame.
+    void publish_peer_ordinary_ingress();
+    // Debug-only: reads rank 1's MTP egress back and compares it, field for field, with rank 0's.
+    // No-op unless the check is enabled and a peer exists.
+    void check_peer_mtp_egress(std::size_t rows);
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
+    void set_peer_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void copy_round_logits();
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
@@ -334,6 +465,7 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view_peer(const SequenceState& sequence) const;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

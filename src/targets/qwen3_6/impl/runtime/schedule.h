@@ -29,6 +29,59 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 using qwen3_6::PreparedPromptData;
 using qwen3_6::PromptModality;
 
+// Current-device save/restore around per-rank issue. Kernel launches go to the CURRENT device, so
+// every op issued for rank r must run with ec.dev[r]->device current; the calls are enqueue-only,
+// so the two ranks' kernels still overlap even though the host issues them in sequence. This
+// mirrors ops::detail::for_each_rank without reaching into an Op's private header, and lives here
+// rather than in one impl header because both the schedule and the MTP round need it.
+class CurrentDevice {
+public:
+    CurrentDevice() { CUDA_CHECK(cudaGetDevice(&previous_)); }
+
+    ~CurrentDevice() { (void)cudaSetDevice(previous_); }
+
+    CurrentDevice(const CurrentDevice&)            = delete;
+    CurrentDevice& operator=(const CurrentDevice&) = delete;
+
+private:
+    int previous_ = 0;
+};
+
+template <class Body>
+void for_each_rank(const ExecutionContext& ec, Body&& body) {
+    const CurrentDevice restore;
+    for (int rank = 0; rank < 2; ++rank) {
+        CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
+        body(rank);
+    }
+}
+
+// Rank 1's half of a tensor-parallel execution. Null at tp == 1, in which case every schedule
+// entry point below behaves exactly as it always has.
+struct TpPeerCore {
+    const ExecutionContext* execution          = nullptr;
+    const ops::PeerEvents* events              = nullptr;
+    DeviceContext* device                      = nullptr;
+    const LoadedModelData* model               = nullptr;
+    WorkspaceArena* work                       = nullptr;
+    LinearAttentionStatePool* linear_attention = nullptr;
+    qwen3_6::RoundState* io                    = nullptr;
+    Tensor* prefill_hidden                     = nullptr;
+    const qwen3_6::PagedKVCache* text_cache    = nullptr;
+    // Present only when the sequence plan enables MTP.
+    const qwen3_6::PagedKVCache* mtp_cache  = nullptr;
+    const GdnReplayRecords* replay_records  = nullptr;
+    // Rank 1's own pinned MTP ingress record (see PeerRuntime::token_counts). It differs from
+    // rank 0's only in the per-row `sampling[row].token_counts` pointer, which must name rank 1's
+    // counter lane: `speculative_accept_greedy_drafts` READS and atomically WRITES that pointer
+    // in sampling mode, and a pointer into the other device's arena is an illegal access without
+    // peer mapping and a silent double-increment with it.
+    const qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
+    // Enrolls rank 1's stream in rank 0's capture. Null when graphs are disabled; the eager path
+    // never reads it.
+    const DecodeGraphPeerBridge* graph_bridge = nullptr;
+};
+
 struct ExecutionCore {
     DeviceContext& device;
     const LoadedModelData& model;
@@ -39,12 +92,36 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    const TpPeerCore* peer = nullptr;
 };
+
+// Assembles the TextContext-side view of `peer`. Returns an empty optional at tp == 1.
+[[nodiscard]] inline std::optional<TpExecution> tp_execution(const ExecutionCore& execution) {
+    if (execution.peer == nullptr) { return std::nullopt; }
+    const TpPeerCore& peer = *execution.peer;
+    TpExecution out;
+    out.execution      = peer.execution;
+    out.events         = peer.events;
+    out.device         = peer.device;
+    out.weights        = peer.model;
+    out.work           = peer.work;
+    out.state          = peer.linear_attention;
+    out.io             = peer.io;
+    out.prefill_hidden = peer.prefill_hidden;
+    out.batch_kv       = peer.text_cache;
+    out.batch_mtp_kv   = peer.mtp_cache;
+    out.replay_records = peer.replay_records;
+    return out;
+}
 
 struct PrefillContext {
     ExecutionCore execution;
     qwen3_6::PagedKVCacheView text_kv;
     qwen3_6::PagedKVCacheView mtp_kv;
+    // Rank 1's per-sequence MTP KV window at tp == 2; empty at tp == 1 and when MTP is off. The
+    // text prefill needs no peer twin because it drives the BATCH cache view plus table rows,
+    // but the MTP prefill appends and reads through the per-sequence execution view.
+    qwen3_6::PagedKVCacheView mtp_kv_peer;
     const qwen3_6::PagedKVCache& text_cache;
     const qwen3_6::PagedKVCache* mtp_cache;
     DFlashPersistentState* dflash;
@@ -64,6 +141,10 @@ struct OrdinaryBatchContext {
     const qwen3_6::OrdinaryDecodeIngress& host_ingress;
     qwen3_6::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Rank 1's own pinned copy of `host_ingress`, with every row's sampling counter pointer
+    // nulled (ProgramImplCore::publish_peer_ordinary_ingress). Required whenever
+    // `execution.tp` is engaged; null at tp1.
+    const qwen3_6::OrdinaryDecodeIngress* peer_host_ingress = nullptr;
 };
 
 struct MtpBatchContext {
@@ -133,6 +214,14 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope);
+// tp == 2 form. `peer` is rank 1's identically-shaped view of ITS OWN frame; the acceptance
+// arithmetic is replicated there rather than transferred, because every one of its inputs is
+// either the ingress record (copied to both frames) or the gathered logits (bit-identical on both
+// ranks). What is NOT replicated is rank 0's bookkeeping: the continuation-hidden scatter and the
+// egress transfer stay on rank 0 alone.
+void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                          TextContext& card, TargetVerifyFrameView frame,
+                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,

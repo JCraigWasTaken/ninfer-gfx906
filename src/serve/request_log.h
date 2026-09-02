@@ -17,6 +17,11 @@
 
 namespace ninfer::serve {
 
+// Bumped when an event's shape changes in a way a reader must know about. Purely ADDITIVE fields
+// in an existing object do not bump it: the Python consumers check the
+// (artifact_type, schema_version, event) tuple for exact equality, so a bump breaks every campaign
+// tool until they are updated in lockstep. Precedent on this branch: `e4a2cac` added five rope
+// fields to `server_start.engine` without a bump, as did the `tp`/`devices` pair after it.
 inline constexpr int kRequestLogSchemaVersion        = 10;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 

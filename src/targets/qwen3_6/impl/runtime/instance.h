@@ -38,6 +38,9 @@ inline constexpr float kGdnScale                         = Variant::gdn_scale;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = Variant::prefill_chunk_alignment;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = Variant::maximum_mtp_draft_tokens;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dflash_draft_tokens;
+// `kNativeMaxContext` is the ONLY reader of `Variant::maximum_context` in the family runtime;
+// every context-derived extent sizes from it (this build has no YaRN extension).
+inline constexpr std::uint32_t kNativeMaxContext = Variant::maximum_context;
 
 inline std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
     return Variant::ordinary_graph_profiles(capacity);

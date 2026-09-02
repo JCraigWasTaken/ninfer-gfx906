@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
+#include "core/device.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -41,8 +42,8 @@ public:
     using Plan     = typename Package::RequestPlan;
     using Clock    = std::chrono::steady_clock;
 
-    ConcurrentExecutor(Instance& instance, const EngineOptions& options)
-        : instance_(instance), max_concurrency_(options.max_concurrency),
+    ConcurrentExecutor(Instance& instance, const EngineOptions& options, const DeviceContext& device)
+        : instance_(instance), device_(device.device), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -55,7 +56,14 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        worker_ = std::thread([this] { worker_loop(); });
+        // Every GPU launch of this executor is issued from worker_, so the thread must be
+        // bound to the Engine's DeviceContext device. Without this the worker runs with the
+        // CUDA default device (ordinal 0) current while the streams, allocations and
+        // per-device kernel attributes belong to device_.
+        worker_ = std::thread([this] {
+            CUDA_CHECK(cudaSetDevice(device_));
+            worker_loop();
+        });
     }
 
     ~ConcurrentExecutor() noexcept {
@@ -196,6 +204,38 @@ public:
             instance_.program->reset_memory_peaks();
             instance_.request_memory.reset_peak();
         } catch (...) {}
+    }
+
+    // Debug-only, OFF by default (see ProgramImplCore::logits_capture): the raw BF16 bits of the
+    // full-vocabulary logits behind the most recently sampled token. Empty unless capture was
+    // enabled; valid only immediately after a generate()/wait() call returns to the calling thread
+    // on a single-lane engine -- there is no per-request association, so concurrent lanes would
+    // make this meaningless. Added for the greedy tp1-vs-tp2 parity harness
+    // (tools/tp2/parity.cpp); not wire-facing.
+    [[nodiscard]] std::vector<std::uint16_t> debug_last_round_logits_bf16() const {
+        std::scoped_lock lock(execution_mutex_);
+        const std::span<const std::uint16_t> bits = instance_.program->last_round_logits_bf16();
+        return std::vector<std::uint16_t>(bits.begin(), bits.end());
+    }
+
+    // Takes the execution mutex, so it cannot land between a round's capture and its read.
+    void debug_enable_logit_capture(bool enabled) {
+        std::scoped_lock lock(execution_mutex_);
+        instance_.program->enable_logits_capture(enabled);
+    }
+
+    // Debug-only, OFF by default (see ProgramImplCore::check_peer_mtp_egress): cross-rank
+    // comparison of the MTP egress record after every speculative round at tp == 2. Takes the
+    // execution mutex for the same reason as the capture toggle above.
+    void debug_enable_peer_egress_check(bool enabled) {
+        std::scoped_lock lock(execution_mutex_);
+        instance_.program->enable_peer_egress_check(enabled);
+    }
+
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> debug_peer_egress_check_counts() const {
+        std::scoped_lock lock(execution_mutex_);
+        return {instance_.program->peer_egress_check_rounds(),
+                instance_.program->peer_egress_check_mismatches()};
     }
 
 private:
@@ -474,22 +514,55 @@ private:
         }
 
         const std::span<const TokenId> tokens(&token, 1);
-        const OutputDecision decision = request->output.preview(
-            tokens, request->budget->remaining(), request->budget->limit_reason());
-        if (decision.accepted_tokens != 1) {
-            throw std::logic_error("prefill output policy did not accept its licensed token");
+        OutputDecision decision;
+        try {
+            decision = request->output.preview(tokens, request->budget->remaining(),
+                                               request->budget->limit_reason());
+            if (decision.accepted_tokens != 1) {
+                throw std::logic_error("prefill output policy did not accept its licensed token");
+            }
+        } catch (...) {
+            // Request scope: detokenization and the stop/channel policy of ONE OutputSession, run
+            // before any Program state moved. See fail_request_scope().
+            fail_request_scope(request, lane, std::current_exception());
+            return true;
         }
         request->generated.push_back(token);
         instance_.program->resolve_prefill_lane(lane, decision.finished());
-        request->budget->commit(1);
-        auto published = request->output.commit_preview();
-        if (!request->first_token) { request->first_token = Clock::now(); }
-        append_output(request, std::move(published));
+        try {
+            request->budget->commit(1);
+            auto published = request->output.commit_preview();
+            if (!request->first_token) { request->first_token = Clock::now(); }
+            append_output(request, std::move(published));
+        } catch (...) {
+            // Request scope: publication of ONE request's own text and budget.
+            fail_request_scope(request, lane, std::current_exception());
+            return true;
+        }
         if (decision.finished()) {
             complete_success(request, decision.finish_reason);
             return true;
         }
         return false;
+    }
+
+    // A failure whose blast radius is exactly one request: its OutputSession (byte-level
+    // detokenization, stop-string/channel policy, published deltas) and its own budget
+    // accounting. Nothing about the device, the shared KV pool or another lane is implicated, so
+    // the lane is torn down, that one request errors, and the Engine stays serviceable. Failures
+    // raised by the Program itself -- CUDA errors from decode_batch/advance_prefill_lane, batch
+    // resolution refusing an inconsistent membership -- are NOT routed here: they leave the
+    // per-request try blocks untouched, reach worker_loop, and still fail_all.
+    //
+    // The caller must not touch this request or lane again except to drop the slot.
+    void fail_request_scope(const std::shared_ptr<Request>& request, std::uint32_t lane,
+                            std::exception_ptr error) {
+        instance_.program->abort_lane(lane);
+        if (prefill_lane_ && *prefill_lane_ == lane) {
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+        }
+        complete_error(request, std::move(error));
     }
 
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
@@ -1001,6 +1074,11 @@ private:
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
+        // A row whose own output session failed. The batch still has to be resolved for every
+        // lane -- the Program's pending state is per-round, not per-row -- so such a row is
+        // resolved as if it had been cancelled (accepted 0, lane cleared) and the request is
+        // errored afterwards, once the shared batch state is consistent again.
+        std::array<std::exception_ptr, kMaximumConcurrency> row_errors{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             const auto& request      = slots_[lane];
@@ -1018,15 +1096,28 @@ private:
                 finish_reasons[row] = FinishReason::Cancelled;
                 continue;
             }
-            const OutputDecision decision = request->output.preview(
-                row_tokens, request->budget->remaining(), request->budget->limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                (!decision.finished() && decision.accepted_tokens != count)) {
-                throw std::logic_error("output policy returned an invalid licensed prefix");
+            try {
+                // Request scope: detokenization and the stop/channel policy of ONE OutputSession.
+                // See fail_request_scope().
+                const OutputDecision decision = request->output.preview(
+                    row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
+                    (!decision.finished() && decision.accepted_tokens != count)) {
+                    throw std::logic_error("output policy returned an invalid licensed prefix");
+                }
+                accepted[row]       = decision.accepted_tokens;
+                terminal[row]       = decision.finished() ? 1 : 0;
+                finish_reasons[row] = decision.finish_reason;
+            } catch (...) {
+                // Resolved exactly like a cancelled row -- accepted 0 with the cancelled flag set,
+                // which is the membership resolve_pending_batch routes to clear_lane. `terminal`
+                // is deliberately left 0: the Program reads it only on the !cancelled branch, so
+                // setting it here would be inert and would misdescribe the row.
+                row_errors[row]     = std::current_exception();
+                accepted[row]       = 0;
+                finish_reasons[row] = FinishReason::None;
+                cancelled[row]      = 1;
             }
-            accepted[row]       = decision.accepted_tokens;
-            terminal[row]       = decision.finished() ? 1 : 0;
-            finish_reasons[row] = decision.finish_reason;
         }
 
         instance_.program->resolve_pending_batch(
@@ -1036,23 +1127,44 @@ private:
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
-            const auto& request      = slots_[lane];
-            if (!cancelled[row]) {
-                const auto row_tokens = round.tokens.subspan(
-                    row * round.row_stride, static_cast<std::size_t>(accepted[row]));
-                request->generated.insert(request->generated.end(), row_tokens.begin(),
-                                          row_tokens.end());
-                request->budget->commit(accepted[row]);
-                consume_service_work(request, accepted[row]);
-            }
-            auto published = request->output.commit_preview();
-            if (!request->first_token && accepted[row] != 0) {
-                request->first_token = Clock::now();
-            }
-            append_output(request, std::move(published));
-            if (terminal[row]) {
-                complete_success(request, finish_reasons[row]);
+            // Held by value: dropping the slot below must not invalidate the handle a failure
+            // path still needs.
+            const std::shared_ptr<Request> request = slots_[lane];
+            if (row_errors[row] != nullptr) {
+                // resolve_pending_batch already cleared the lane for this row.
+                complete_error(request, row_errors[row]);
                 remove_completed_slot(lane);
+                continue;
+            }
+            // ENGINE scope, deliberately outside the fence below: consume_service_work draws down
+            // the service projection the admission policy froze for every active request, and it
+            // throws when the Program licensed more work than the plan reserved. That divergence
+            // invalidates the protection/backfill arithmetic for the whole active set, not just
+            // this request, and the drawdown cannot be skipped for one row without leaving the
+            // shared accounting overstated for as long as the lane lives.
+            if (!cancelled[row]) { consume_service_work(request, accepted[row]); }
+            try {
+                if (!cancelled[row]) {
+                    const auto row_tokens = round.tokens.subspan(
+                        row * round.row_stride, static_cast<std::size_t>(accepted[row]));
+                    request->generated.insert(request->generated.end(), row_tokens.begin(),
+                                              row_tokens.end());
+                    request->budget->commit(accepted[row]);
+                }
+                auto published = request->output.commit_preview();
+                if (!request->first_token && accepted[row] != 0) {
+                    request->first_token = Clock::now();
+                }
+                append_output(request, std::move(published));
+                if (terminal[row]) {
+                    complete_success(request, finish_reasons[row]);
+                    remove_completed_slot(lane);
+                }
+            } catch (...) {
+                // Request scope: publication of ONE request's own text and generation budget,
+                // after its batch row was already resolved.
+                fail_request_scope(request, lane, std::current_exception());
+                if (slots_[lane] != nullptr) { remove_completed_slot(lane); }
             }
         }
         ++cumulative_stats_.decode_rounds;
@@ -1144,6 +1256,15 @@ private:
                     continue;
                 }
             } catch (...) {
+                // Engine scope only. Everything whose blast radius is a single request is caught
+                // and completed at its own site (fail_request_scope for output/publication,
+                // remove_pending_error for planning and admission-time refusals), so what reaches
+                // here is a failure of the shared execution unit -- a CUDA error, a Program state
+                // inconsistency, an exhausted device allocation, or a service-projection drawdown
+                // that the Program's licensing contradicts. admit_planned_request cleans its
+                // lane up and rethrows on purpose: its region is dominated by start_prefill_lane,
+                // a device execution unit. The Engine cannot keep serving after one of those:
+                // every in-flight and queued request fails and the worker stops.
                 fail_all(std::current_exception());
                 return;
             }
@@ -1151,6 +1272,7 @@ private:
     }
 
     Instance& instance_;
+    const int device_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;

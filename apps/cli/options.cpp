@@ -41,6 +41,33 @@ int parse_device(const char* text) {
     return static_cast<int>(value);
 }
 
+int parse_tp(const char* text) {
+    const std::uint64_t value = parse_u64(text, "tp");
+    if (value != 1 && value != 2) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    }
+    return static_cast<int>(value);
+}
+
+std::vector<int> parse_devices(const char* text) {
+    std::vector<int> result;
+    const std::string_view view(text);
+    std::size_t start = 0;
+    while (start <= view.size()) {
+        const std::size_t comma = view.find(',', start);
+        const std::string_view token =
+            comma == std::string_view::npos ? view.substr(start) : view.substr(start, comma - start);
+        if (token.empty()) { throw std::invalid_argument(std::string("invalid devices: ") + text); }
+        result.push_back(parse_device(std::string(token).c_str()));
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    if (result.empty() || result.size() > 2) {
+        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    }
+    return result;
+}
+
 float parse_float(const char* text, std::string_view label, float minimum, float maximum) {
     errno              = 0;
     char* end          = nullptr;
@@ -76,13 +103,13 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N] [--tp 1|2] [--devices N,N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
+           "       [--raw-output] [--print-token-ids] [--no-thinking] [--ignore-eos]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
            "       [--no-cuda-graph]\n"
            "\n"
@@ -94,7 +121,20 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
-           "individual fields.\n";
+           "individual fields.\n"
+           "--tp selects the tensor-parallel degree (default 1); --tp 2 splits the model across "
+           "two GPUs and requires --devices; it supports --spec mtp but not --spec dflash, and "
+           "not --vision.\n"
+           "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
+           "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
+           "primary device.\n"
+           "--ignore-eos drops the checkpoint\'s own end-of-turn token ids from the request "
+           "stop policy, so decode continues to --max-new or the remaining context capacity; "
+           "--stop-token-id, --stop and --reasoning-stop still apply.\n"
+           "--no-cuda-graph runs decode eagerly. At --tp 2 that is the same two-stream forward "
+           "pass with cross-device event synchronization, in place of one captured cross-device "
+           "graph; it is the escape hatch if capture ever misbehaves, and it produces the same "
+           "tokens.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -106,6 +146,8 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool device_explicit      = false;
+    bool devices_explicit     = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -129,6 +171,12 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+            device_explicit = true;
+        } else if (arg == "--tp") {
+            options.tp = parse_tp(value(arg));
+        } else if (arg == "--devices") {
+            options.devices  = parse_devices(value(arg));
+            devices_explicit = true;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
@@ -143,6 +191,8 @@ Options parse_options(int argc, char** argv) {
             options.print_token_ids = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--ignore-eos") {
+            options.ignore_eos = true;
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
@@ -193,6 +243,18 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+
+    if (devices_explicit) {
+        if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
+            throw std::invalid_argument("--devices must list exactly --tp device ids");
+        }
+        if (device_explicit && options.devices.front() != options.device) {
+            throw std::invalid_argument("--device and --devices disagree on the primary device");
+        }
+        options.device = options.devices.front();
+    } else if (options.tp == 1) {
+        options.devices = {options.device};
     }
 
     const bool has_prompt   = !options.prompt.empty();

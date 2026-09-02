@@ -149,6 +149,20 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
     print_metric("tensors/resources",
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
+    print_metric("tensor parallel", std::to_string(load.tp) + (load.tp > 1 ? " (split)" : ""));
+    for (int rank = 0; rank < load.tp; ++rank) {
+        const ninfer::DeviceMemoryReport& row = load.devices[static_cast<std::size_t>(rank)];
+        const std::string label               = "gpu" + std::to_string(row.device);
+        print_metric(label + " weights", format_bytes(row.weights_bytes));
+        print_metric(label + " kv pool", format_bytes(row.kv_pool_bytes));
+        print_metric(label + " gdn state", format_bytes(row.gdn_state_bytes));
+        print_metric(label + " sequence", format_bytes(row.sequence_bytes));
+        print_metric(label + " workspace", format_bytes(row.workspace_bytes));
+        print_metric(label + " cuda graphs", format_bytes(row.cuda_graph_bytes));
+        print_metric(label + " reserved", format_bytes(row.reserved_bytes));
+        print_metric(label + " free/total", format_bytes(row.free_after_startup_bytes) + " / " +
+                                                format_bytes(row.total_bytes));
+    }
 }
 
 void print_generation_summary(const ninfer::GenerationResult& result,
@@ -251,6 +265,7 @@ int main(int argc, char** argv) {
         request.execution.requested_output_tokens = cli.max_new;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
+        request.stop.include_model_defaults       = !cli.ignore_eos;
         request.output.raw                        = cli.raw_output;
 
         std::cerr << "phase       detail                      elapsed/progress\n";
@@ -259,6 +274,8 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path  = cli.artifact_path;
         engine_options.device         = cli.device;
+        engine_options.tp             = cli.tp;
+        engine_options.devices        = cli.devices;
         engine_options.max_context    = cli.max_context;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;

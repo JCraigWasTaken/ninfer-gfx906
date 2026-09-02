@@ -131,7 +131,10 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
-          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
+          // Byte-level alphabet entries: "ä"/"¸"/"Ń" are the three bytes of "中" (E4 B8 AD),
+          // and "À"/"õ" are the bytes 0xC0/0xF5 -- values that can never lead a UTF-8 sequence.
+          // A real checkpoint vocabulary carries all 256 byte tokens; these are the ones the tests need.
+          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}, {"À", 13}, {"õ", 14}}},
           {"merges", nlohmann::json::array()}}},
         {"added_tokens",
          tokens}}.dump();
@@ -1104,6 +1107,84 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     return failures;
 }
 
+// Publishing generated text runs on the Engine's worker thread, where an escaping exception fails
+// every in-flight and queued request. A byte-level vocabulary makes ill-formed byte
+// sequences an ORDINARY generated-token outcome, not a contract violation: 77 of the 256 byte
+// tokens (0x80-0xBF, 0xC0/0xC1, 0xF5-0xFF) can never begin a code point, and greedy decoding on
+// the shipped checkpoints does sample them. Each ill-formed subsequence must become exactly one
+// U+FFFD -- the same substitution a token-budget-truncated tail already gets -- and the decoder
+// must resynchronize so that the text after it is exact.
+int test_invalid_utf8_is_replaced(const Frontend& frontend) {
+    constexpr std::string_view replacement = "\xef\xbf\xbd";
+    int failures                           = 0;
+
+    // Each case is a run of generated tokens fed one at a time, and the concatenated content text
+    // they must publish. Token bytes: 0 = 'x', 10 = 0xE4, 11 = 0xB8, 12 = 0xAD, 13 = 0xC0,
+    // 14 = 0xF5.
+    struct Case {
+        std::string_view name;
+        std::vector<ninfer::TokenId> tokens;
+        std::string text;
+    };
+    const std::vector<Case> cases{
+        // A lone continuation byte: nothing can complete it in either direction.
+        {"lone continuation byte", {11}, std::string(replacement)},
+        // Leading bytes that no continuation can rescue.
+        {"invalid lead 0xC0", {13}, std::string(replacement)},
+        {"invalid lead 0xF5", {14}, std::string(replacement)},
+        // A truncated sequence terminated by a byte that starts a new code point: one U+FFFD for
+        // the maximal subpart, then the following text exactly (Unicode 15 §3.9 recommendation).
+        {"truncated sequence then ASCII", {10, 0}, std::string(replacement) + "x"},
+        // Two bytes of a three-byte sequence, then a byte that is neither a continuation nor a
+        // valid lead: one U+FFFD for "E4 B8", a second for the 0xC0 that broke it.
+        {"truncated sequence then invalid lead",
+         {10, 11, 13},
+         std::string(replacement) + std::string(replacement)},
+        // The decoder resynchronizes: a complete code point split across three tokens still
+        // decodes exactly after a replacement.
+        {"replacement then split code point",
+         {11, 10, 11, 12},
+         std::string(replacement) + "\xe4\xb8\xad"},
+        // Unaffected control: the same split code point with no ill-formed bytes at all.
+        {"split code point", {10, 11, 12}, "\xe4\xb8\xad"},
+    };
+
+    for (const Case& item : cases) {
+        auto prompt             = frontend.prepare_tokens({0});
+        auto session            = frontend.make_output_session(prompt, {});
+        std::uint32_t remaining = static_cast<std::uint32_t>(item.tokens.size()) + 1;
+        std::string published;
+        bool threw = false;
+        try {
+            for (const ninfer::TokenId token : item.tokens) {
+                const auto decision = session.preview(std::array<ninfer::TokenId, 1>{token},
+                                                      remaining, ninfer::FinishReason::OutputLimit);
+                remaining -= decision.accepted_tokens;
+                published += channel_text(session.commit_preview(), ninfer::OutputChannel::Content);
+            }
+        } catch (...) { threw = true; }
+        failures += check(!threw, "generated-token detokenization threw instead of replacing");
+        failures += check(published == item.text, "invalid UTF-8 replacement text is wrong");
+        if (published != item.text) {
+            std::cerr << "  case '" << item.name << "': published " << published.size()
+                      << " bytes, expected " << item.text.size() << '\n';
+        }
+    }
+
+    // The held-prefix path is unchanged: a still-completable tail publishes nothing until the code
+    // point completes, and a token budget that ends on one still terminalizes to a single U+FFFD.
+    auto prompt  = frontend.prepare_tokens({0});
+    auto session = frontend.make_output_session(prompt, {});
+    const auto held =
+        session.preview(std::array<ninfer::TokenId, 1>{10}, 1, ninfer::FinishReason::OutputLimit);
+    failures += check(held.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "held UTF-8 prefix did not end at the token budget");
+    failures += check(channel_text(session.commit_preview(), ninfer::OutputChannel::Content) ==
+                          std::string(replacement),
+                      "truncated tail did not terminalize to the replacement character");
+    return failures;
+}
+
 int test_disabled_vision() {
     const Frontend frontend = FrontendFactory::create_component(resources(), false);
     int failures = check(throws_invalid_argument([&] { (void)frontend.prepare(image_input()); }),
@@ -1325,6 +1406,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
+    failures += test_invalid_utf8_is_replaced(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();
     failures += test_media_live_bytes_follow_last_payload_reference();

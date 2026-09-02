@@ -70,8 +70,14 @@ struct SequencePlanningInputs {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    // The ceiling `capacity` was admitted against (the variant's native capacity).
+    std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
     int device          = 0;
+    // Tensor-parallel width. Every per-device geometry below (KV heads, GDN value heads, GDN conv
+    // channels) is the model's own extent divided by `tp`, because each device holds only its own
+    // head shard. Page COUNTS are not divided: all devices carry the same pages.
+    int tp = 1;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -92,8 +98,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
     int device          = 0;
+    int tp              = 1;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;
