@@ -99,9 +99,22 @@ struct Q5GemvChunkGfx906 {
     }
 };
 
+// Pass 2g: LDS layout of the staged x in the T=1 kernels. Natural layout has
+// lane hl reading 4 uint4 at a 64 B lane stride (banks 0/16 only: a 16-way
+// ds_read_b128 conflict, the pass-2e finding). true = the small-T
+// [step][v][lane] layout (gfx906_stage_x_slab at T=1): uint4 slot
+// step * 128 + v * 32 + hl, so every ds_read_b128 is wave-wide contiguous.
+constexpr bool kGfx906GemvXSwizzle = true;
+
+// Natural uint4 index i = step * 128 + hl * 4 + v -> swizzled slot.
+__device__ __forceinline__ int gfx906_swizzle_x_slot(int i) {
+    return (i & ~127) | ((i & 3) << 5) | ((i >> 2) & 31);
+}
+
 template <int kN, int kK, bool kResidual, bool kSplitOutput = false, int kSplitRow = 0,
           class Epilogue = Q5GemvStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false,
-          int kDepth = 2, bool kStageX = true, int kThreads = Gfx906GemvGeometry::kThreads>
+          int kDepth = 2, bool kStageX = true, int kThreads = Gfx906GemvGeometry::kThreads,
+          bool kSwizzleX = kGfx906GemvXSwizzle>
 __global__ void __launch_bounds__(kThreads)
 q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                       const std::uint8_t* __restrict__ high_bits,
@@ -163,7 +176,7 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
             h.y    = gfx906_bf16x2_to_half2(v.y);
             h.z    = gfx906_bf16x2_to_half2(v.z);
             h.w    = gfx906_bf16x2_to_half2(v.w);
-            x_s[i] = h;
+            x_s[kSwizzleX ? gfx906_swizzle_x_slot(i) : i] = h;
         }
         __syncthreads();
     }
@@ -183,10 +196,13 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
         const int k0 = (s * (G::kLanesPerRow / 2) + (hl >> 1)) * Chunk::Storage::kGroupK +
                        G::kValuesPerLane * (hl & 1);
         if constexpr (kStageX) {
-            const uint4* x_s4 = reinterpret_cast<const uint4*>(x_sh) + (k0 >> 3);
+            // swizzled: slots s * 128 + v * 32 + hl; natural: 4 uint4 at k0 / 8.
+            constexpr int kVStride = kSwizzleX ? G::kLanesPerRow : 1;
+            const uint4* x_s4      = reinterpret_cast<const uint4*>(x_sh) +
+                                (kSwizzleX ? s * (G::kValuesPerStep / 8) + hl : (k0 >> 3));
 #pragma unroll
             for (int v = 0; v < 4; ++v) {
-                const uint4 xv = x_s4[v];
+                const uint4 xv = x_s4[v * kVStride];
                 acc            = gfx906_fdot2(w[4 * v + 0], xv.x, acc);
                 acc            = gfx906_fdot2(w[4 * v + 1], xv.y, acc);
                 acc            = gfx906_fdot2(w[4 * v + 2], xv.z, acc);
@@ -288,7 +304,8 @@ struct Q4GemvChunkGfx906 {
 };
 
 // Epilogue contract: epilogue(out, row, gate_acc, up_acc) from half-lane 0.
-template <int kIntermediate, int kK, class Epilogue, int kDepth = 2>
+template <int kIntermediate, int kK, class Epilogue, int kDepth = 2,
+          bool kSwizzleX = kGfx906GemvXSwizzle>
 __global__ void __launch_bounds__(Gfx906GemvGeometry::kThreads)
 q4_swiglu_pair_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
@@ -342,7 +359,7 @@ q4_swiglu_pair_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x,
             h.y    = gfx906_bf16x2_to_half2(v.y);
             h.z    = gfx906_bf16x2_to_half2(v.z);
             h.w    = gfx906_bf16x2_to_half2(v.w);
-            x_s[i] = h;
+            x_s[kSwizzleX ? gfx906_swizzle_x_slot(i) : i] = h;
         }
     }
     __syncthreads();
@@ -365,10 +382,12 @@ q4_swiglu_pair_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x,
 
         const int k0      = (s * (G::kLanesPerRow / 2) + (hl >> 1)) * Chunk::Storage::kGroupK +
                        G::kValuesPerLane * (hl & 1);
-        const uint4* x_s4 = reinterpret_cast<const uint4*>(x_sh) + (k0 >> 3);
+        constexpr int kVStride = kSwizzleX ? G::kLanesPerRow : 1;
+        const uint4* x_s4      = reinterpret_cast<const uint4*>(x_sh) +
+                            (kSwizzleX ? s * (G::kValuesPerStep / 8) + hl : (k0 >> 3));
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
-            const uint4 xv = x_s4[v];
+            const uint4 xv = x_s4[v * kVStride];
             acc_g          = gfx906_fdot2(wg[4 * v + 0], xv.x, acc_g);
             acc_u          = gfx906_fdot2(wu[4 * v + 0], xv.x, acc_u);
             acc_g          = gfx906_fdot2(wg[4 * v + 1], xv.y, acc_g);
