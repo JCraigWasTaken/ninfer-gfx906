@@ -110,3 +110,35 @@ Verdict: hygiene, not speed — exactly what the batch-E profile said would happ
 band; prefill within noise. The port is now current with upstream on the portable runtime and kernel changes and
 three gate tests build for the first time. Pass 2 (T=1 GEMV retune) is the speed lever; its design brief is
 docs/gfx906/PASS2-DESIGN.md.
+
+## 5. Pass 2 results (2026-09-02, T=1 GEMV retune, four shapes, PROMOTED)
+
+One kernel family for all four (src/ops/linear/gfx906/q_gemv_gfx906.cuh): register-resident wave64 Q4/Q5 chunk
+streams (weights read once, loads issued before the LDS barrier), x staged once per block as fp16 in LDS with the
+stage-8 bias trick, v_dot2_f32_f16 into fp32, a DPP reduction ladder over each 32-lane half of a wave64
+(gfx906_reduce_sum32 in warp.cuh), the upstream epilogue contract called from half-lane 0. Env knob
+NINFER_GFX906_PASS2 (default on, =0 reverts every route). kDepth=1 won every depth screen: with the step loop
+unrolled the compiler hoists loads anyway and deeper rings only cost VGPRs. The only per-shape choice was rows per
+block, set by LDS occupancy and the grid tail on 60 CUs.
+
+| shape | kernel before | after | speedup | GB/s (fraction of ~810) | tg128 after | commit |
+|---|---|---|---|---|---|---|
+| q5 5120x6144 out-proj + residual | 121 us | 53.6 us | 2.26x | 386 (48 %) | 13.32 | 6f8e9a8a, 1c8e37d6 |
+| q4 swiglu gate/up pair 17408x2 x 5120 | 585 us | 151 us | 3.87x | 626 (77 %) | 19.44 | 17bd4cda, 50d18106 |
+| q5 down 5120x17408 + residual | 229 us | 139 us | 1.65x | 421 (52 %) | 21.87 | 676b30c4 |
+| q5 GDN v/z 12288x5120 split + conv/snapshot | 153.5 us | 96.2 us | 1.60x | ~405 (50 %) | 23.32 | 751290d7 |
+
+Tier-2 interleaved A/B (tg128): off 12.73 / on 23.27 / off 12.64 / on 23.23. Prefill unchanged (T=1 never runs
+in prefill). Greedy p4-MTP and p3-plain outputs byte-identical with the knob on and off after every shape. Probe v3
+at 30,881 tokens through ninfer-serve: 7/7, argument hash identical to llama.cpp. RAS 0 throughout.
+
+Lessons: at K=17408 the lever is waves sharing one LDS copy of x (1024-thread block), not ring depth, and never
+route x through L2 per lane (the loads serialise behind vmcnt(0)). The down projection missed its 110 us target
+because 5120/32 = 160 blocks leaves a tail on 60 CUs and no block size between 16 and 32 rows divides N. The GDN
+conv_snapshot unit test has a pre-existing std::bad_alloc (arena undersized for the gfx906 plan) with the knob on
+and off, so the T=1 snapshot path is covered by the greedy gates only.
+
+MTP did NOT move (code d3 22.89 / prose d2 13.19, identical to pass 0): the verify step runs T=3-5 and those routes
+are still the stage-3 scalar fallbacks (the stage-8 tiled GEMM only wins at T>=6). Plain decode now equals MTP on
+code and beats it on prose, the stage-8 inversion again by the same mechanism. Pass 2e extends the family to
+T=2..5; prediction MTP code 35-45, prose 24-28. It runs before pass 3 because MTP is the production path.
