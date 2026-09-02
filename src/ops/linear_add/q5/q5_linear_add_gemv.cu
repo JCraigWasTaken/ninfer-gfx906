@@ -14,6 +14,18 @@
 
 namespace ninfer::ops::detail {
 
+#if defined(NINFER_GFX906_COMPAT)
+// Pass 2c tuning for the down projection (5120x17408): chunks in flight per
+// lane, whether x is staged in LDS (34 KB) or read through L2, and threads
+// per block (rows per block = threads / 32). Screened 2026-09-02: LDS x at
+// 256 threads is capped at 4 waves/CU by the 34 KB (229 us); x through L2
+// serialises on its own loads (192 us); a 1024-thread block sharing one LDS
+// copy of x (16 waves/CU, grid 160) is the winner at kDepth 1 (139.5 us).
+constexpr int kQ5DownDepthGfx906   = 1;
+constexpr bool kQ5DownStageXGfx906 = true;
+constexpr int kQ5DownThreadsGfx906 = 1024;
+#endif
+
 void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                         cudaStream_t stream) {
     const auto* xp     = static_cast<const __nv_bfloat16*>(x.data);
@@ -34,8 +46,18 @@ void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor
                 xp, codes, high, scales, out, stream);
         }
     } else if (w.n == 5120 && w.k == 17408 && w.padded_shape[1] == 17408) {
-        q5_rowsplit_gemv_residual_launch_kernel<5120, 17408, 16, 2, false>(xp, codes, high, scales,
-                                                                           out, stream);
+#if defined(NINFER_GFX906_COMPAT)
+        // Pass 2c: same register-resident GEMV, K=17408 (NINFER_GFX906_PASS2=0 reverts).
+        if (gfx906_pass2_gemv_enabled()) {
+            q5_gemv_gfx906_residual_launch<5120, 17408, kQ5DownDepthGfx906, kQ5DownStageXGfx906,
+                                           kQ5DownThreadsGfx906>(xp, codes, high, scales, out,
+                                                                 stream);
+        } else
+#endif
+        {
+            q5_rowsplit_gemv_residual_launch_kernel<5120, 17408, 16, 2, false>(
+                xp, codes, high, scales, out, stream);
+        }
     } else {
         throw std::invalid_argument("q5 linear_add GEMV: unsupported exact shape");
     }

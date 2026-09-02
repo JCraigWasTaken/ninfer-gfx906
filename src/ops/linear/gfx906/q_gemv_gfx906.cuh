@@ -31,6 +31,10 @@
 //    out[row] first when kResidual, so Q5GemvStoreEpilogue / the residual path
 //    / Q5GdnDecodeEpilogue plug in unchanged. PDL hooks preserved (no-ops on
 //    gfx906).
+//  - kStageX=false (pass 2c, K=17408): x is NOT staged in LDS and there is no
+//    block barrier; each lane reads its own 64 B of x per step straight from
+//    global (L2 hits after the first block) and converts BF16 -> FP16 in
+//    registers. Removes the 34 KB LDS occupancy limit at K=17408.
 
 #include "core/pdl.cuh"
 #include "ops/common/warp.cuh"
@@ -97,8 +101,8 @@ struct Q5GemvChunkGfx906 {
 
 template <int kN, int kK, bool kResidual, bool kSplitOutput = false, int kSplitRow = 0,
           class Epilogue = Q5GemvStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false,
-          int kDepth = 2>
-__global__ void __launch_bounds__(Gfx906GemvGeometry::kThreads)
+          int kDepth = 2, bool kStageX = true, int kThreads = Gfx906GemvGeometry::kThreads>
+__global__ void __launch_bounds__(kThreads)
 q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                       const std::uint8_t* __restrict__ high_bits,
                       const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
@@ -108,8 +112,12 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
     constexpr int kGroups   = kK / Chunk::Storage::kGroupK;
     constexpr int kSteps    = kK / G::kValuesPerStep;
     constexpr int kInFlight = kDepth < kSteps ? kDepth : kSteps;
+    // Rows per block follow the block size (kThreads / 32): 256 threads = 8
+    // rows; 1024 threads = 16 waves = 32 rows sharing one LDS copy of x.
+    constexpr int kRowsPerBlock = kThreads / G::kLanesPerRow;
+    static_assert(kThreads % 64 == 0 && kThreads >= 64 && kThreads <= 1024, "1..16 wave64 per block");
     static_assert(kK % G::kValuesPerStep == 0, "K must be a multiple of 1024");
-    static_assert(kN % G::kRowsPerBlock == 0, "N must be a multiple of 8 rows");
+    static_assert(kN % kRowsPerBlock == 0, "N must be a multiple of the rows per block");
     static_assert(kDepth >= 1, "need at least one chunk in flight");
     static_assert(!kSplitOutput || (kSplitRow > 0 && kSplitRow < kN),
                   "split-output GEMV requires an interior compile-time seam");
@@ -119,15 +127,16 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
         if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     }
 
-    // x as fp16 pairs (kK / 2 dwords), 16-byte aligned for uint4 traffic.
-    __shared__ __align__(16) std::uint32_t x_sh[kK / 2];
+    // x as fp16 pairs (kK / 2 dwords), 16-byte aligned for uint4 traffic
+    // (unused 16 B placeholder when x is read through L2).
+    __shared__ __align__(16) std::uint32_t x_sh[kStageX ? kK / 2 : 4];
 
     const int tid    = static_cast<int>(threadIdx.x);
     const int wave   = tid >> 6;
     const int lane64 = tid & 63;
     const int half   = lane64 >> 5;
     const int hl     = lane64 & 31;
-    const int row    = static_cast<int>(blockIdx.x) * G::kRowsPerBlock + wave * G::kRowsPerWave + half;
+    const int row    = static_cast<int>(blockIdx.x) * kRowsPerBlock + wave * G::kRowsPerWave + half;
 
     const std::uint8_t* code_row =
         codes + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kCodeBytesPerGroup;
@@ -142,12 +151,12 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
 #pragma unroll
     for (int s = 0; s < kInFlight; ++s) { raw[s] = Chunk::load(code_row, high_row, scale_row, s, hl); }
 
-    {
+    if constexpr (kStageX) {
         // x is 16-byte aligned (activations come from the 256-byte-aligned
         // workspace arena; the tests allocate with cudaMalloc).
         const auto* x_g = reinterpret_cast<const uint4*>(x);
         auto* x_s       = reinterpret_cast<uint4*>(x_sh);
-        for (int i = tid; i < kK / 8; i += G::kThreads) {
+        for (int i = tid; i < kK / 8; i += kThreads) {
             const uint4 v = x_g[i];
             uint4 h;
             h.x    = gfx906_bf16x2_to_half2(v.x);
@@ -156,8 +165,8 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
             h.w    = gfx906_bf16x2_to_half2(v.w);
             x_s[i] = h;
         }
+        __syncthreads();
     }
-    __syncthreads();
 
     float acc = 0.0f;
 #pragma unroll
@@ -171,16 +180,30 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
         Chunk::decode(cur, w);
 
         // fp16 x pairs for values [k0, k0+32): 16 dwords = 4 uint4 at dword k0/2.
-        const int k0        = (s * (G::kLanesPerRow / 2) + (hl >> 1)) * Chunk::Storage::kGroupK +
+        const int k0 = (s * (G::kLanesPerRow / 2) + (hl >> 1)) * Chunk::Storage::kGroupK +
                        G::kValuesPerLane * (hl & 1);
-        const uint4* x_s4   = reinterpret_cast<const uint4*>(x_sh) + (k0 >> 3);
+        if constexpr (kStageX) {
+            const uint4* x_s4 = reinterpret_cast<const uint4*>(x_sh) + (k0 >> 3);
 #pragma unroll
-        for (int v = 0; v < 4; ++v) {
-            const uint4 xv = x_s4[v];
-            acc            = gfx906_fdot2(w[4 * v + 0], xv.x, acc);
-            acc            = gfx906_fdot2(w[4 * v + 1], xv.y, acc);
-            acc            = gfx906_fdot2(w[4 * v + 2], xv.z, acc);
-            acc            = gfx906_fdot2(w[4 * v + 3], xv.w, acc);
+            for (int v = 0; v < 4; ++v) {
+                const uint4 xv = x_s4[v];
+                acc            = gfx906_fdot2(w[4 * v + 0], xv.x, acc);
+                acc            = gfx906_fdot2(w[4 * v + 1], xv.y, acc);
+                acc            = gfx906_fdot2(w[4 * v + 2], xv.z, acc);
+                acc            = gfx906_fdot2(w[4 * v + 3], xv.w, acc);
+            }
+        } else {
+            // Same 32 values straight from global as bf16 (64 B contiguous per
+            // lane, 16-byte aligned), converted to fp16 pairs in registers.
+            const uint4* x_g4 = reinterpret_cast<const uint4*>(x + k0);
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const uint4 xb = x_g4[v];
+                acc            = gfx906_fdot2(w[4 * v + 0], gfx906_bf16x2_to_half2(xb.x), acc);
+                acc            = gfx906_fdot2(w[4 * v + 1], gfx906_bf16x2_to_half2(xb.y), acc);
+                acc            = gfx906_fdot2(w[4 * v + 2], gfx906_bf16x2_to_half2(xb.z), acc);
+                acc            = gfx906_fdot2(w[4 * v + 3], gfx906_bf16x2_to_half2(xb.w), acc);
+            }
         }
     }
 
@@ -202,15 +225,16 @@ inline void q5_gemv_gfx906_launch(const __nv_bfloat16* x, const std::uint8_t* co
                                                              nullptr);
 }
 
-template <int kN, int kK>
+template <int kN, int kK, int kDepth = 2, bool kStageX = true,
+          int kThreads = Gfx906GemvGeometry::kThreads>
 inline void q5_gemv_gfx906_residual_launch(const __nv_bfloat16* x, const std::uint8_t* codes,
                                            const std::uint8_t* high_bits,
                                            const std::uint8_t* scales,
                                            __nv_bfloat16* residual_out, cudaStream_t stream) {
-    constexpr int kGrid = kN / Gfx906GemvGeometry::kRowsPerBlock;
-    q5_gemv_gfx906_kernel<kN, kK, true>
-        <<<kGrid, Gfx906GemvGeometry::kThreads, 0, stream>>>(x, codes, high_bits, scales,
-                                                             residual_out, nullptr);
+    constexpr int kGrid = kN / (kThreads / Gfx906GemvGeometry::kLanesPerRow);
+    q5_gemv_gfx906_kernel<kN, kK, true, false, 0, Q5GemvStoreEpilogue, false, false, kDepth, kStageX,
+                          kThreads><<<kGrid, kThreads, 0, stream>>>(x, codes, high_bits, scales,
+                                                                     residual_out, nullptr);
 }
 
 
