@@ -142,3 +142,27 @@ MTP did NOT move (code d3 22.89 / prose d2 13.19, identical to pass 0): the veri
 are still the stage-3 scalar fallbacks (the stage-8 tiled GEMM only wins at T>=6). Plain decode now equals MTP on
 code and beats it on prose, the stage-8 inversion again by the same mechanism. Pass 2e extends the family to
 T=2..5; prediction MTP code 35-45, prose 24-28. It runs before pass 3 because MTP is the production path.
+
+## 6. Pass 2e-2g (2026-09-02): small-T verify routes, the logit check, the T=1 swizzle
+
+Pass 2e (commits 8dcb27ab, 4d24a1ab): the pass-2 kernel family extended to T=2..5 on the swiglu pair, q5 down and
+q5 out-proj (x = T fp16 vectors staged per K-slab in LDS under a 32 KB cap, T accumulators, weights still read
+once). Knob NINFER_GFX906_PASS2_SMALLT. MTP code d3 22.89 -> 36.66 (acc 95 %), prose d2 13.19 -> 22.21 (acc 55 %);
+plain unchanged. Found a 16-way LDS bank conflict (64 B lane stride -> banks 0/16 only); swizzling x to
+[step][v][lane] cut the T=5 kernels 1.5-1.7x. GDN 12288x5120 at T>1 stays on the Materialized route.
+Close batch: probe v3 30K 7/7, same argument hash; MTP reproduced.
+
+Pass 2f (d25e725d, 4bee688f): the greedy MTP output diverged from the old routes at token 46/128. The upstream
+perplexity evaluator (f6b3ba93) is not portable (needs EngineCore/CausalScoreCore/context-cache; diff saved in
+stage10/pass2f-partial.diff); the target_logprobs op (0b5b7c9a) was picked. Substitute instrument: an env-gated
+top-2 logit dump in the sample/argmax launchers (NINFER_GFX906_DUMP_TOP2=1, NINFER_GFX906_WATCH_IDS=..., needs
+--no-cuda-graph). At token 46 the old tiled route had an EXACT bf16 tie (18.1250/18.1250, argmax tie-break by
+index), the new small-T route 18.1250/18.2500 (one ulp), and the untouched plain T=1 route agrees with the new one.
+Verdict: near-tie flip, old kernel rounding low; pass 2e promoted. The donor TP2 doc reaches the same conclusion
+about free-running greedy comparisons (§6.1) and uses teacher-forced per-position parity instead.
+
+Pass 2g (f5651be2): the same swizzle on the four T=1 kernels: -0.9 % / -2.0 % / noise / neutral (hidden at T=1 as
+predicted); byte-identical; kept for one layout. tg128 23.55.
+
+Single-card standing at the end of pass 2 (card 2, groupwise-int, bf16-K/fp16-V KV): plain 23.55, MTP code d3
+36.2-36.7, MTP prose d2 22.1-22.2, pp512 211, probe v3 30K 7/7. Day start: 12.66 / 22.9 / 13.2.
