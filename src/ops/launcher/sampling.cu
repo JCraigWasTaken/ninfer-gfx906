@@ -7,6 +7,7 @@
 #include "ops/common/math.h"
 #include "ops/kernel/sampling.cuh"
 #include "core/device.h"
+#include "ops/launcher/gfx906_top2_dump.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -14,7 +15,7 @@ std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32
     return make_sampling_workspace_layout(token_domain, columns).bytes;
 }
 
-void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+static void sample_batch_launch_impl(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
                          std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
     const std::int32_t physical_rows     = logits.ne[0];
@@ -42,6 +43,15 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
         static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
         partial_blocks, groups, scratch);
     CUDA_CHECK(cudaGetLastError());
+}
+
+
+void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
+                         const SamplingConfig* configs, const Tensor& logical_positions,
+                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
+    sample_batch_launch_impl(logits, out, token_domain, configs, logical_positions, purpose,
+                             workspace, stream);
+    gfx906_dump_top2("sample", logits, out, token_domain, stream);
 }
 
 } // namespace ninfer::ops::detail

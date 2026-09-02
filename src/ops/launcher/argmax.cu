@@ -8,6 +8,7 @@
 #include "ops/common/token_slices.h"
 #include "ops/kernel/argmax.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "ops/launcher/gfx906_top2_dump.cuh"
 
 #include <cstdint>
 
@@ -37,8 +38,8 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
 
 } // namespace
 
-void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
-                   cudaStream_t stream) {
+static void argmax_launch_impl(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
+                               cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t t_count       = logits.ne[1];
     if (t_count == 0) { return; }
@@ -55,6 +56,12 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
 
     argmax_tiled_atomic_launch(logits, out, valid_rows,
                                tiled_block_for(physical_rows, valid_rows, t_count), stream);
+}
+
+void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
+                   cudaStream_t stream) {
+    argmax_launch_impl(logits, out, valid_rows, stream);
+    gfx906_dump_top2("argmax", logits, out, valid_rows, stream);
 }
 
 namespace {
