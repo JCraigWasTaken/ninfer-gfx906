@@ -9,6 +9,10 @@
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/q_gemv_gfx906.cuh"
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
 
 #include <cuda_bf16.h>
 
@@ -17,6 +21,19 @@
 
 namespace ninfer::ops::detail {
 namespace {
+
+#if defined(NINFER_GFX906_COMPAT)
+// Pass 2d tuning for the T=1 q5 value/z projection (12288x5120): chunks in
+// flight per lane, x staged in LDS (10 KB at K=5120) or read through L2, and
+// threads per block (rows per block = threads / 32). NINFER_GFX906_PASS2=0
+// keeps the upstream q5_rowsplit_gemv route. Screened 2026-09-02 (rocprofv3
+// per-call average over 33 decode calls x 48 layers; upstream kernel 153.4 us):
+// 256 threads d1 101.3 us / d2 101.7; 512 threads d1 96.1 us (chosen, 32
+// VGPRs, grid 768) / d2 97.6; 1024 threads d1 98.7 us. Depth 1 wins again.
+constexpr int kQ5GdnDepthGfx906   = 1;
+constexpr bool kQ5GdnStageXGfx906 = true;
+constexpr int kQ5GdnThreadsGfx906 = 512;
+#endif
 
 constexpr int kHidden      = 5120;
 constexpr int kQueryRows   = 2048;
@@ -157,6 +174,40 @@ template <class Publish, bool TriggerPdl, bool JoinPdl, bool Dependent>
 void launch_q5_t1(const Tensor& x, const Weight& value_z_weight,
                   const GdnConvEpilogue<Publish>& value_epilogue, Tensor& value, Tensor& z,
                   cudaStream_t stream) {
+#if defined(NINFER_GFX906_COMPAT)
+    // Pass 2d: register-resident wave64 GEMV, split output at kValueRows; the
+    // epilogue (conv/snapshot store for rows < kValueRows, bf16 z store above)
+    // runs once per row from half-lane 0 exactly as in the upstream kernel.
+    if (gfx906_pass2_gemv_enabled()) {
+        constexpr int kGfxRowsPerBlock = kQ5GdnThreadsGfx906 / Gfx906GemvGeometry::kLanesPerRow;
+        constexpr int kGfxBlocks       = kValueZRows / kGfxRowsPerBlock;
+        using GfxKernelEpilogue        = Q5GdnDecodeEpilogue<Publish>;
+        constexpr auto kernel =
+            q5_gemv_gfx906_kernel<kValueZRows, kHidden, false, true, kValueRows, GfxKernelEpilogue,
+                                  TriggerPdl, JoinPdl, kQ5GdnDepthGfx906, kQ5GdnStageXGfx906,
+                                  kQ5GdnThreadsGfx906>;
+        const GfxKernelEpilogue epilogue{value_epilogue, static_cast<__nv_bfloat16*>(z.data)};
+        if constexpr (Dependent) {
+            CUDA_CHECK(pdl::launch_dependent(
+                {dim3(kGfxBlocks), dim3(kQ5GdnThreadsGfx906), 0, stream}, kernel,
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(value_z_weight.qdata),
+                static_cast<const std::uint8_t*>(value_z_weight.qhigh),
+                static_cast<const std::uint8_t*>(value_z_weight.scales),
+                static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
+                epilogue));
+        } else {
+            kernel<<<kGfxBlocks, kQ5GdnThreadsGfx906, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(value_z_weight.qdata),
+                static_cast<const std::uint8_t*>(value_z_weight.qhigh),
+                static_cast<const std::uint8_t*>(value_z_weight.scales),
+                static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
+                epilogue);
+        }
+        return;
+    }
+#endif
     constexpr int q5_rows_per_block = 16;
     constexpr int q5_threads        = q5_rows_per_block * 32;
     constexpr int q5_blocks         = kValueZRows / q5_rows_per_block;

@@ -548,6 +548,7 @@ int main() {
     }
 
     int failures                   = 0;
+#if !defined(NINFER_GFX906_COMPAT)
     const auto fp8_record_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
                                         std::int32_t min_width, std::int32_t max_width) {
         return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -563,10 +564,13 @@ int main() {
         std::cerr << "FP8 record capacity did not preserve measured route witnesses\n";
         ++failures;
     }
+#endif
     failures += run_q4_q5();
     failures += run_w8();
+#if !defined(NINFER_GFX906_COMPAT)
     failures += run_nvfp4();
     failures += run_fp8();
+#endif
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }
