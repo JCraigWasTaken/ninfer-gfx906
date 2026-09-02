@@ -42,6 +42,47 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::abort();
 }
 
+ExecutionContext::ExecutionContext(const std::vector<int>& device_ids) {
+    if (device_ids.empty() || device_ids.size() > dev.size()) {
+        throw std::runtime_error("ExecutionContext requires 1 or 2 device ids, got " +
+                                 std::to_string(device_ids.size()));
+    }
+    tp = static_cast<int>(device_ids.size());
+    // Distinct ids are a correctness precondition, not a preference: every tensor-parallel op
+    // pairs `dev[0]` with `dev[1]` and assumes the two hold DIFFERENT shards on DIFFERENT devices.
+    // `--devices 0,0` would build two contexts on one GPU, halve nothing, and make the peer
+    // copies alias their own source -- silently wrong rather than slow.
+    for (std::size_t i = 0; i < device_ids.size(); ++i) {
+        for (std::size_t j = i + 1; j < device_ids.size(); ++j) {
+            if (device_ids[i] == device_ids[j]) {
+                throw std::runtime_error(
+                    "ExecutionContext requires distinct device ids, got device " +
+                    std::to_string(device_ids[i]) + " twice");
+            }
+        }
+    }
+    for (std::size_t i = 0; i < device_ids.size(); ++i) {
+        dev[i].emplace(device_ids[i]); // validates existence internally
+    }
+    if (tp == 2) {
+        const cudaDeviceProp& p0 = dev[0]->props;
+        const cudaDeviceProp& p1 = dev[1]->props;
+        if (p0.major != p1.major || p0.minor != p1.minor) {
+            throw std::runtime_error(
+                "ExecutionContext requires all devices to share the same compute capability "
+                "(device " +
+                std::to_string(dev[0]->device) + " is gfx " + std::to_string(p0.major) +
+                std::to_string(p0.minor) + ", device " + std::to_string(dev[1]->device) +
+                " is gfx " + std::to_string(p1.major) + std::to_string(p1.minor) + ")");
+        }
+    }
+    // POSTCONDITION: rank 0 is the current device. Constructing the contexts in order leaves the
+    // LAST one current, so at tp == 2 an ExecutionContext would hand its caller a thread bound to
+    // device 1 -- and every caller that then issues work without naming a device (the whole tp1
+    // code path, and rank-0-only steps like sampling) would silently target the wrong GPU.
+    cuda_check(cudaSetDevice(dev[0]->device), "cudaSetDevice(dev[0])", __FILE__, __LINE__);
+}
+
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
     int count       = 0;
     cudaError_t err = cudaGetDeviceCount(&count);

@@ -228,6 +228,9 @@ ninfer_add_op_test(ninfer_prepare_masked_block_test
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_allreduce_test
+  SOURCES ops/test_allreduce.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES ninfer_ops)

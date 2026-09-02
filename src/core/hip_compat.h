@@ -163,3 +163,58 @@ __device__ __forceinline__ void __syncwarp(unsigned = 0) {
     __builtin_amdgcn_wave_barrier();
 }
 #endif // defined(__HIPCC__)
+
+// --- TP2 slice 1: peer access, pointer attributes, capture status ------------
+// Used by src/ops/common/allreduce.cu, split_launch.h and tools/tp2/*_probe.cu.
+// hipPointerAttribute_t's memory-type field is `.type` on ROCm 6.x (verified
+// against /opt/rocm/include/hip/hip_runtime_api.h in the 6.4.1 container), so
+// the CUDA-12 `attributes.type == cudaMemoryTypeDevice` use sites port verbatim.
+#define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
+#define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaPointerGetAttributes hipPointerGetAttributes
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaMemoryTypeDevice hipMemoryTypeDevice
+#define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaFuncAttribute hipFuncAttribute
+
+// Probe-only surface (tools/tp2): the peer-copy control, graph node inspection,
+// and the capture-info / capture-dependency forms the transport probe splices a
+// memcpy node with. CUDA 12 grew edge-data arguments on cudaStreamGetCaptureInfo
+// and cudaStreamUpdateCaptureDependencies; HIP keeps the CUDA 11 shapes, so the
+// two overloads below accept the CUDA-12 call sites (edge data must be nullptr).
+#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaGraphNode_t hipGraphNode_t
+#define cudaGraphNodeType hipGraphNodeType
+#define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
+#define cudaGraphNodeTypeMemcpy hipGraphNodeTypeMemcpy
+#define cudaGraphNodeGetType hipGraphNodeGetType
+#define cudaGraphAddMemcpyNode hipGraphAddMemcpyNode
+#define cudaMemcpy3DParms hipMemcpy3DParms
+#define make_cudaPitchedPtr make_hipPitchedPtr
+#define make_cudaExtent make_hipExtent
+#define cudaStreamSetCaptureDependencies hipStreamSetCaptureDependencies
+inline hipError_t ninfer_hip_stream_get_capture_info(hipStream_t stream,
+                                                     hipStreamCaptureStatus* status,
+                                                     unsigned long long* id) {
+    return hipStreamGetCaptureInfo(stream, status, id);
+}
+inline hipError_t ninfer_hip_stream_get_capture_info(hipStream_t stream,
+                                                     hipStreamCaptureStatus* status,
+                                                     unsigned long long* id, hipGraph_t* graph,
+                                                     const hipGraphNode_t** dependencies,
+                                                     std::nullptr_t /*edge data*/,
+                                                     std::size_t* dependency_count) {
+    return hipStreamGetCaptureInfo_v2(stream, status, id, graph, dependencies, dependency_count);
+}
+#define cudaStreamGetCaptureInfo ninfer_hip_stream_get_capture_info
+inline hipError_t ninfer_hip_stream_update_capture_dependencies(hipStream_t stream,
+                                                                hipGraphNode_t* dependencies,
+                                                                std::nullptr_t /*edge data*/,
+                                                                std::size_t count,
+                                                                unsigned int flags) {
+    return hipStreamUpdateCaptureDependencies(stream, dependencies, count, flags);
+}
+#define cudaStreamUpdateCaptureDependencies ninfer_hip_stream_update_capture_dependencies

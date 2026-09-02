@@ -2,8 +2,11 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <vector>
 
 namespace ninfer {
 
@@ -37,6 +40,23 @@ struct DeviceContext {
     DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
+};
+
+// One process, up to two devices. dev[0..tp-1] hold constructed DeviceContext instances;
+// the remaining slots stay empty. tp == 1 unless the caller opts into `--tp 2`, which runs the
+// tensor-parallel program across both devices.
+struct ExecutionContext {
+    std::array<std::optional<DeviceContext>, 2> dev;
+    int tp = 1;
+
+    // device_ids.size() must be 1 or 2 and becomes tp. Every id is validated to exist by
+    // DeviceContext's own constructor; when two ids are given they must additionally share the
+    // same compute capability (major.minor), since nothing downstream can reconcile mismatched
+    // architectures.
+    explicit ExecutionContext(const std::vector<int>& device_ids);
+
+    [[nodiscard]] DeviceContext& primary() noexcept { return *dev[0]; }
+    [[nodiscard]] const DeviceContext& primary() const noexcept { return *dev[0]; }
 };
 
 class CudaEventTimer {
