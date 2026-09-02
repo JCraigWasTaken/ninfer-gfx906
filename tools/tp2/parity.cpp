@@ -1119,7 +1119,14 @@ int exercise(const char* artifact) {
 
     // ---- secondary row: tp2 graphs vs tp2 eager ----------------------------------------------
     bool graphs_all_exact = true;
-    {
+    // gfx906 port: NINFER_TP2_PARITY_GRAPHS=0 skips the secondary row. A captured dual-device
+    // graph replays correctly on ROCm 6.4.1 but ~65x slower than eager (slice 6: 0.21 t/s), so a
+    // free-run over the whole corpus with graphs on does not fit a test budget on the MI50 pair.
+    const bool run_graph_row = env_u32("NINFER_TP2_PARITY_GRAPHS", 1) != 0;
+    if (!run_graph_row) {
+        std::cout << "phase F: tp2 graphs-on vs tp2 eager (secondary) -- SKIPPED "
+                     "(NINFER_TP2_PARITY_GRAPHS=0)\n";
+    } else {
         std::cout << "phase F: tp2 graphs-on vs tp2 eager (secondary)\n";
         Rig graphs("tp2-graph", engine_options(artifact, 2, /*graphs=*/true, kPrefillChunk));
         graphs.open();
@@ -1453,7 +1460,8 @@ int exercise(const char* artifact) {
     std::cout << "logit-capture self-check: " << capture_mismatches
               << " probes where the sampled token was not the captured argmax\n";
     std::cout << "engine text-decode failures recovered: " << text_decode_failures << '\n';
-    std::cout << "tp2 graphs vs eager: " << (graphs_all_exact ? "exact on every prompt" : "DIFFERS")
+    std::cout << "tp2 graphs vs eager: "
+              << (!run_graph_row ? "not run" : graphs_all_exact ? "exact on every prompt" : "DIFFERS")
               << '\n';
 
     // THE GATE.
