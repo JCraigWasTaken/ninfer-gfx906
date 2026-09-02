@@ -2,6 +2,10 @@
 
 #include "core/device.h"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+#if defined(NINFER_GFX906_COMPAT)
+#include "ops/linear/gfx906/q_gemv_gfx906.cuh"
+#include "ops/linear/gfx906/stage8_route.h"
+#endif
 
 #include <cuda_bf16.h>
 
@@ -19,8 +23,16 @@ void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor
     auto* out          = static_cast<__nv_bfloat16*>(residual_out.data);
 
     if (w.n == 5120 && w.k == 6144 && w.padded_shape[1] == 6144) {
-        q5_rowsplit_gemv_residual_launch_kernel<5120, 6144, 16, 2, true>(xp, codes, high, scales,
-                                                                         out, stream);
+#if defined(NINFER_GFX906_COMPAT)
+        // Pass 2: register-resident wave64 GEMV (NINFER_GFX906_PASS2=0 reverts).
+        if (gfx906_pass2_gemv_enabled()) {
+            q5_gemv_gfx906_residual_launch<5120, 6144>(xp, codes, high, scales, out, stream);
+        } else
+#endif
+        {
+            q5_rowsplit_gemv_residual_launch_kernel<5120, 6144, 16, 2, true>(
+                xp, codes, high, scales, out, stream);
+        }
     } else if (w.n == 5120 && w.k == 17408 && w.padded_shape[1] == 17408) {
         q5_rowsplit_gemv_residual_launch_kernel<5120, 17408, 16, 2, false>(xp, codes, high, scales,
                                                                            out, stream);

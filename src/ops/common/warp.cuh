@@ -42,6 +42,36 @@ __device__ __forceinline__ float warp_max(float x, unsigned mask = kFullWarpMask
     return x;
 }
 
+#if defined(NINFER_GFX906_COMPAT)
+// Wave64 DPP reduction (pass 2, donor llama.cpp-gfx906 warp_reduce_amd_f32
+// ladder): sums x across each 32-lane half of a wave64 independently, both
+// halves at once, using row-local DPP moves instead of ds_bpermute shuffles.
+// Every lane of a half ends with that half's total.
+//   xor1 / xor2 : quad_perm(1,0,3,2) = 0xB1, quad_perm(2,3,0,1) = 0x4E
+//   +4 / +8     : row_ror:4 = 0x124, row_ror:8 = 0x128 (after the quad steps
+//                 every lane of a quad holds the quad sum, so rotating by 4 then
+//                 8 within the 16-lane row gives the row total in every lane)
+//   xor16       : ds_swizzle bit mode (and 0x1f, or 0, xor 0x10) = 0x401F; the
+//                 swizzle never crosses a 32-lane group, which is the point.
+// Used by the pass-2 GEMV only; warp_reduce_sum users are unchanged.
+__device__ __forceinline__ float gfx906_reduce_sum32(float x) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    // row_mask = bank_mask = 0xf (all rows/banks), bound_ctrl = true.
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0xB1, 0xf, 0xf, true));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x4E, 0xf, 0xf, true));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x124, 0xf, 0xf, true));
+    x += __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x128, 0xf, 0xf, true));
+    x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x401F));
+#else
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        x += __shfl_xor_sync(kFullWarpMask, x, offset, 32);
+    }
+#endif
+    return x;
+}
+#endif // NINFER_GFX906_COMPAT
+
 template <int BlockSize>
 __device__ __forceinline__ float block_reduce_sum(float x, float* sums) {
     static_assert(BlockSize >= kWarpSize && BlockSize <= 1024);
