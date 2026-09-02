@@ -122,14 +122,23 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
                       __nv_bfloat16* __restrict__ out_tail, Epilogue epilogue = {}) {
     using G     = Gfx906GemvGeometry;
     using Chunk = Q5GemvChunkGfx906;
-    constexpr int kGroups   = kK / Chunk::Storage::kGroupK;
-    constexpr int kSteps    = kK / G::kValuesPerStep;
-    constexpr int kInFlight = kDepth < kSteps ? kDepth : kSteps;
+    constexpr int kGroups = kK / Chunk::Storage::kGroupK;
+    // TP2 slice 7, K tail (mlp/down row-parallel shard, K = 8704 = 8 x 1024 +
+    // 512): the last step covers kTailValues values on the first kTailLanes
+    // lanes of each half-wave (one 16 B chunk = 32 values per lane, so 512 ->
+    // 16 lanes); lanes at or past kTailLanes neither load nor accumulate on
+    // that step. kTailLanes == 0 (every tp1 shape) folds the predicate away.
+    constexpr int kFullSteps  = kK / G::kValuesPerStep;
+    constexpr int kTailValues = kK % G::kValuesPerStep;
+    constexpr int kTailLanes  = kTailValues / G::kValuesPerLane;
+    constexpr int kSteps      = kFullSteps + (kTailValues > 0 ? 1 : 0);
+    constexpr int kInFlight   = kDepth < kSteps ? kDepth : kSteps;
     // Rows per block follow the block size (kThreads / 32): 256 threads = 8
     // rows; 1024 threads = 16 waves = 32 rows sharing one LDS copy of x.
     constexpr int kRowsPerBlock = kThreads / G::kLanesPerRow;
     static_assert(kThreads % 64 == 0 && kThreads >= 64 && kThreads <= 1024, "1..16 wave64 per block");
-    static_assert(kK % G::kValuesPerStep == 0, "K must be a multiple of 1024");
+    static_assert(kK % Chunk::Storage::kGroupK == 0, "K must be a multiple of the group size");
+    static_assert(kFullSteps >= 1, "K must cover at least one full 1024-value step");
     static_assert(kN % kRowsPerBlock == 0, "N must be a multiple of the rows per block");
     static_assert(kDepth >= 1, "need at least one chunk in flight");
     static_assert(!kSplitOutput || (kSplitRow > 0 && kSplitRow < kN),
@@ -140,9 +149,11 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
         if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     }
 
-    // x as fp16 pairs (kK / 2 dwords), 16-byte aligned for uint4 traffic
-    // (unused 16 B placeholder when x is read through L2).
-    __shared__ __align__(16) std::uint32_t x_sh[kStageX ? kK / 2 : 4];
+    // x as fp16 pairs (kK / 2 dwords; the swizzled layout pads a K tail to a
+    // full 1024-value step slot), 16-byte aligned for uint4 traffic (unused
+    // 16 B placeholder when x is read through L2).
+    constexpr int kXDwords = kSwizzleX ? kSteps * G::kValuesPerStep / 2 : kK / 2;
+    __shared__ __align__(16) std::uint32_t x_sh[kStageX ? kXDwords : 4];
 
     const int tid    = static_cast<int>(threadIdx.x);
     const int wave   = tid >> 6;
@@ -158,11 +169,21 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
     const std::uint8_t* scale_row =
         scales + static_cast<std::int64_t>(row) * kGroups * Chunk::Storage::kScaleBytesPerGroup;
 
+    // Step s is live for this lane unless it is the K-tail step and the lane
+    // sits past the tail (s is a compile-time constant after unrolling).
+    const auto step_active = [&](int s) -> bool {
+        return kTailLanes == 0 || s < kFullSteps || hl < kTailLanes;
+    };
+    const auto load_step = [&](int s) -> typename Chunk::Raw {
+        if (step_active(s)) { return Chunk::load(code_row, high_row, scale_row, s, hl); }
+        return typename Chunk::Raw{};
+    };
+
     // Issue the first weight chunk loads before staging x so DRAM requests are
     // in flight during the block's x conversion + barrier.
     typename Chunk::Raw raw[kInFlight];
 #pragma unroll
-    for (int s = 0; s < kInFlight; ++s) { raw[s] = Chunk::load(code_row, high_row, scale_row, s, hl); }
+    for (int s = 0; s < kInFlight; ++s) { raw[s] = load_step(s); }
 
     if constexpr (kStageX) {
         // x is 16-byte aligned (activations come from the 256-byte-aligned
@@ -186,9 +207,8 @@ q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* _
     for (int s = 0; s < kSteps; ++s) {
         const int slot               = s % kInFlight;
         const typename Chunk::Raw cur = raw[slot];
-        if (s + kInFlight < kSteps) {
-            raw[slot] = Chunk::load(code_row, high_row, scale_row, s + kInFlight, hl);
-        }
+        if (s + kInFlight < kSteps) { raw[slot] = load_step(s + kInFlight); }
+        if (!step_active(s)) { continue; }
         std::uint32_t w[16];
         Chunk::decode(cur, w);
 
@@ -421,7 +441,13 @@ q4_swiglu_pair_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x,
 
 template <int kK, int kT, int kLdsCapBytes>
 struct Gfx906SmallTSlab {
-    static constexpr int kSteps         = kK / Gfx906GemvGeometry::kValuesPerStep;
+    // TP2 slice 7: a K tail (K % 1024 != 0, mlp/down shard K = 8704) is one
+    // extra step live on the first kTailLanes lanes of each half-wave; the
+    // slab K stays step-aligned and the x staging zero-fills past K.
+    static constexpr int kFullSteps     = kK / Gfx906GemvGeometry::kValuesPerStep;
+    static constexpr int kTailValues    = kK % Gfx906GemvGeometry::kValuesPerStep;
+    static constexpr int kTailLanes     = kTailValues / Gfx906GemvGeometry::kValuesPerLane;
+    static constexpr int kSteps         = kFullSteps + (kTailValues > 0 ? 1 : 0);
     static constexpr int kBytesPerStepT = kT * Gfx906GemvGeometry::kValuesPerStep * 2; // fp16
     static constexpr int kCapSteps      = kLdsCapBytes / kBytesPerStepT;
     static constexpr int kSlabSteps =
@@ -437,7 +463,9 @@ struct Gfx906SmallTSlab {
 // storing its v-th uint4 at step * 128 + v * 32 + hl makes each ds_read_b128
 // wave-wide contiguous (conflict-free) instead of 64 B-strided (banks 0/16
 // only, 16-way conflict). Caller owns the barriers.
-template <int kT, int kSlabK, int kThreads>
+// kKTotal > 0 bounds the x reads (a K tail: slots at or past K are
+// zero-filled); 0 = the slab is entirely inside x.
+template <int kT, int kSlabK, int kThreads, int kKTotal = 0>
 __device__ __forceinline__ void gfx906_stage_x_slab(std::uint32_t* __restrict__ x_sh,
                                                     const __nv_bfloat16* __restrict__ x, int x_ld,
                                                     int k_base, int tid) {
@@ -451,8 +479,11 @@ __device__ __forceinline__ void gfx906_stage_x_slab(std::uint32_t* __restrict__ 
         const int v    = (pos >> 5) & 3;
         const int hl   = pos & 31;
         const int nat  = step * 128 + hl * 4 + v; // natural uint4 index
-        const uint4 b  = *reinterpret_cast<const uint4*>(
-            x + static_cast<std::int64_t>(t) * x_ld + k_base + nat * 8);
+        uint4 b        = make_uint4(0u, 0u, 0u, 0u);
+        if (kKTotal == 0 || k_base + nat * 8 < kKTotal) {
+            b = *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(t) * x_ld + k_base +
+                                                nat * 8);
+        }
         uint4 h;
         h.x    = gfx906_bf16x2_to_half2(b.x);
         h.y    = gfx906_bf16x2_to_half2(b.y);
@@ -477,10 +508,17 @@ q5_gemv_smallt_gfx906_kernel(const __nv_bfloat16* __restrict__ x, int x_ld,
     constexpr int kRowsPerBlock = kThreads / G::kLanesPerRow;
     static_assert(kT >= 2 && kT <= 8, "small-T kernel covers T=2..8");
     static_assert(kThreads % 64 == 0 && kThreads >= 64 && kThreads <= 1024, "1..16 wave64 per block");
-    static_assert(kK % G::kValuesPerStep == 0, "K must be a multiple of 1024");
+    static_assert(kK % Chunk::Storage::kGroupK == 0, "K must be a multiple of the group size");
+    static_assert(Slab::kFullSteps >= 1, "K must cover at least one full 1024-value step");
     static_assert(kN % kRowsPerBlock == 0, "N must be a multiple of the rows per block");
 
     __shared__ __align__(16) std::uint32_t x_sh[Slab::kLdsDwords];
+
+    // K-tail predicate (see Gfx906SmallTSlab); folds away when kTailLanes == 0.
+    const int hl_tail             = static_cast<int>(threadIdx.x) & 31;
+    const auto step_active        = [&](int s) -> bool {
+        return Slab::kTailLanes == 0 || s < Slab::kFullSteps || hl_tail < Slab::kTailLanes;
+    };
 
     const int tid    = static_cast<int>(threadIdx.x);
     const int wave   = tid >> 6;
@@ -506,14 +544,22 @@ q5_gemv_smallt_gfx906_kernel(const __nv_bfloat16* __restrict__ x, int x_ld,
 #pragma unroll
     for (int slab = 0; slab < Slab::kSlabs; ++slab) {
         if (slab > 0) { __syncthreads(); } // previous slab's LDS reads retired
-        gfx906_stage_x_slab<kT, Slab::kSlabK, kThreads>(x_sh, x, x_ld, slab * Slab::kSlabK, tid);
+        gfx906_stage_x_slab<kT, Slab::kSlabK, kThreads, (Slab::kTailLanes > 0 ? kK : 0)>(
+            x_sh, x, x_ld, slab * Slab::kSlabK, tid);
         __syncthreads();
 #pragma unroll
         for (int ss = 0; ss < Slab::kSlabSteps; ++ss) {
             const int s = slab * Slab::kSlabSteps + ss;
             if (s < kSteps) {
                 const typename Chunk::Raw cur = raw;
-                if (s + 1 < kSteps) { raw = Chunk::load(code_row, high_row, scale_row, s + 1, hl); }
+                if (s + 1 < kSteps) {
+                    if (step_active(s + 1)) {
+                        raw = Chunk::load(code_row, high_row, scale_row, s + 1, hl);
+                    } else {
+                        raw = typename Chunk::Raw{};
+                    }
+                }
+                if (!step_active(s)) { continue; }
                 std::uint32_t w[16];
                 Chunk::decode(cur, w);
                 // fp16 x pairs for values [32 hl, 32 hl + 32) of slab-step ss: swizzled

@@ -250,6 +250,15 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         return;
     case Q5LinearAddScheduleId::TiledResidualGfx906:
 #if defined(NINFER_GFX906_COMPAT)
+        // TP2 slice 7: the row-parallel shard rows (K = 3072 / 8704) take the
+        // pass-2 T=1 GEMV (K-tail instantiation at 8704) when
+        // NINFER_GFX906_PASS2 is on; off keeps the tiled residual GEMM. The
+        // small-T gate below covers the shard shapes at T=2..5 as well.
+        if (problem.cols == 1 && (problem.k == 3072 || problem.k == 8704) &&
+            gfx906_pass2_gemv_enabled()) {
+            q5_linear_add_gemv_residual_launch(x, w, residual_out, stream);
+            return;
+        }
         // Pass 2e: T=2..5 (the MTP verify widths) take the register-resident
         // small-T GEMV; NINFER_GFX906_PASS2_SMALLT=0 keeps the tiled GEMM.
         if (gfx906_pass2_smallt_enabled() &&

@@ -72,7 +72,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s --k 6144|17408 [--t-sweep 1,2,...] [--warmup N] "
+            std::printf("Usage: %s --k 6144|17408|3072|8704 [--t-sweep 1,2,...] [--warmup N] "
                         "[--repeat N] [--profile]\n",
                         argv[0]);
             std::exit(0);
@@ -80,8 +80,9 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
         }
     }
-    if (options.hidden != 6144 && options.hidden != 17408) {
-        throw std::invalid_argument("--k must be 6144 or 17408");
+    if (options.hidden != 6144 && options.hidden != 17408 && options.hidden != 3072 &&
+        options.hidden != 8704) {
+        throw std::invalid_argument("--k must be 6144 or 17408 (tp1) or 3072 or 8704 (tp2 shard)");
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");

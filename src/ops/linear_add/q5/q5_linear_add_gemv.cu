@@ -24,6 +24,13 @@ namespace ninfer::ops::detail {
 constexpr int kQ5DownDepthGfx906   = 1;
 constexpr bool kQ5DownStageXGfx906 = true;
 constexpr int kQ5DownThreadsGfx906 = 1024;
+
+// TP2 slice 7: the row-parallel shard halves (o_proj / gdn/output K = 3072,
+// mlp/down K = 8704). K = 8704 is the K-tail instantiation (8 x 1024 + 512,
+// q_gemv_gfx906.cuh); x in LDS is 18 KB (tail step padded), so 512 threads
+// (16 rows per block, grid 320) keeps 3 blocks = 24 waves per CU at kDepth 1.
+constexpr int kQ5DownShardDepthGfx906   = 1;
+constexpr int kQ5DownShardThreadsGfx906 = 512;
 #endif
 
 void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
@@ -58,6 +65,19 @@ void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor
             q5_rowsplit_gemv_residual_launch_kernel<5120, 17408, 16, 2, false>(
                 xp, codes, high, scales, out, stream);
         }
+#if defined(NINFER_GFX906_COMPAT)
+    } else if (w.n == 5120 && w.k == 3072 && w.padded_shape[1] == 3072 &&
+               gfx906_pass2_gemv_enabled()) {
+        // TP2 slice 7: o_proj / gdn/output row-parallel shard (pass-2 route only;
+        // the plan keeps the tiled residual GEMM when NINFER_GFX906_PASS2=0).
+        q5_gemv_gfx906_residual_launch<5120, 3072>(xp, codes, high, scales, out, stream);
+    } else if (w.n == 5120 && w.k == 8704 && w.padded_shape[1] == 8704 &&
+               gfx906_pass2_gemv_enabled()) {
+        // TP2 slice 7: mlp/down row-parallel shard, K-tail instantiation.
+        q5_gemv_gfx906_residual_launch<5120, 8704, kQ5DownShardDepthGfx906, true,
+                                       kQ5DownShardThreadsGfx906>(xp, codes, high, scales, out,
+                                                                  stream);
+#endif
     } else {
         throw std::invalid_argument("q5 linear_add GEMV: unsupported exact shape");
     }
@@ -89,6 +109,15 @@ bool q5_linear_add_gemv_smallt_gfx906_launch(const Tensor& x, const Weight& w,
             t, xp, x_ld, codes, high, scales, out, out_ld, stream);
     } else if (w.n == 5120 && w.k == 17408 && w.padded_shape[1] == 17408) {
         launched = q5_gemv_smallt_gfx906_dispatch<5120, 17408, true, kQ5AddSmallTThreadsGfx906,
+                                                  kQ5AddSmallTLdsCapGfx906>(
+            t, xp, x_ld, codes, high, scales, out, out_ld, stream);
+    } else if (w.n == 5120 && w.k == 3072 && w.padded_shape[1] == 3072) {
+        // TP2 slice 7: row-parallel shard halves (K = 3072 clean, K = 8704 K-tail).
+        launched = q5_gemv_smallt_gfx906_dispatch<5120, 3072, true, kQ5AddSmallTThreadsGfx906,
+                                                  kQ5AddSmallTLdsCapGfx906>(
+            t, xp, x_ld, codes, high, scales, out, out_ld, stream);
+    } else if (w.n == 5120 && w.k == 8704 && w.padded_shape[1] == 8704) {
+        launched = q5_gemv_smallt_gfx906_dispatch<5120, 8704, true, kQ5AddSmallTThreadsGfx906,
                                                   kQ5AddSmallTLdsCapGfx906>(
             t, xp, x_ld, codes, high, scales, out, out_ld, stream);
     }
