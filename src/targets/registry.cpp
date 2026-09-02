@@ -99,7 +99,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes =
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
+        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes[0]);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
 
     auto progress     = artifact_progress(options.load_progress);

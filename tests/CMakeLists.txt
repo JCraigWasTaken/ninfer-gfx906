@@ -62,6 +62,10 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+# Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
+ninfer_add_test(ninfer_tensor_slice_test
+  SOURCES test_tensor_slice.cpp
+  LIBRARIES ninfer_artifact)
 ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)
@@ -123,6 +127,23 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE hip::host)
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+# Host-only: TP2 shard map for the 27B binding plan (no artifact, no device).
+ninfer_add_test(ninfer_qwen3_6_27b_shard_map_test
+  SOURCES targets/qwen3_6_27b/test_shard_map.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_6_27b_shard_map_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+target_link_libraries(ninfer_qwen3_6_27b_shard_map_test PRIVATE hip::host)
+# Sharded (tp=2) materialization against a real artifact; skips (77) without the artifact or devices.
+ninfer_add_test(ninfer_qwen3_6_27b_sharded_materialization_test
+  SOURCES targets/qwen3_6_27b/test_sharded_materialization.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_6_27b_sharded_materialization_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+target_link_libraries(ninfer_qwen3_6_27b_sharded_materialization_test PRIVATE hip::host)
+set_tests_properties(ninfer_qwen3_6_27b_sharded_materialization_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)

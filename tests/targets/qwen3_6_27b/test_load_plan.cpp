@@ -55,7 +55,7 @@ int verify_groupwise(const std::filesystem::path& path) {
     if (plan.materialization.object_count != 1124 ||
         plan.materialization.device_objects.size() != 1118 ||
         plan.materialization.host_objects.size() != 6 ||
-        plan.materialization.device_capacity_bytes == 0) {
+        plan.materialization.device_capacity_bytes[0] == 0) {
         std::cerr << "groupwise materialization plan is incomplete\n";
         return 1;
     }
@@ -99,7 +99,7 @@ int verify_nvfp4(const std::filesystem::path& path) {
         plan.materialization.object_count - plan.materialization.device_objects.size() -
                 plan.materialization.host_objects.size() !=
             247 ||
-        plan.materialization.device_capacity_bytes == 0) {
+        plan.materialization.device_capacity_bytes[0] == 0) {
         std::cerr << "NVFP4 materialization plan is incomplete: objects="
                   << plan.materialization.object_count
                   << " device=" << plan.materialization.device_objects.size()

@@ -219,7 +219,7 @@ int run(const Options& options) {
     const auto resolution = ninfer::runtime::resolve_kv_capacity(
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
     auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
-    const std::uint64_t weight_bytes   = load_plan.materialization().device_capacity_bytes;
+    const std::uint64_t weight_bytes   = load_plan.materialization().device_capacity_bytes[0];
     const std::uint64_t sequence_bytes = sequence.device_reservation_bytes();
     if (sequence_bytes > std::numeric_limits<std::uint64_t>::max() - weight_bytes) {
         throw std::overflow_error("benchmark device-memory requirement overflows uint64");
