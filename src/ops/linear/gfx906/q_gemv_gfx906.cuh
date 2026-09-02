@@ -97,7 +97,7 @@ struct Q5GemvChunkGfx906 {
 
 template <int kN, int kK, bool kResidual, bool kSplitOutput = false, int kSplitRow = 0,
           class Epilogue = Q5GemvStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false,
-          int kDepth = 4>
+          int kDepth = 2>
 __global__ void __launch_bounds__(Gfx906GemvGeometry::kThreads)
 q5_gemv_gfx906_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                       const std::uint8_t* __restrict__ high_bits,
