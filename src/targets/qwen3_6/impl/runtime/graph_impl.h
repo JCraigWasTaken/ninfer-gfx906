@@ -14,7 +14,9 @@ void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body
         if (!executable->ready()) {
             throw std::logic_error("decode graph was not prepared at load time");
         }
-        if (state.execution.peer != nullptr) {
+        if (state.execution.peer != nullptr && !state.execution.peer->events->flag_sync()) {
+            // Flag-sync (gfx906 S9): the executable launches rank 1's graph on rank 1's own
+            // stream, which orders it after that stream's outstanding work by itself.
             const TpPeerCore& peer = *state.execution.peer;
             if (peer.graph_bridge == nullptr) {
                 throw std::logic_error("tensor-parallel graph launch requires a peer bridge");
@@ -49,10 +51,18 @@ void capture_graph(Context& state, DecodeGraphDefinition& definition, Body&& bod
         return;
     }
     const TpPeerCore& peer = *state.execution.peer;
+    peer.work->reset();
+    if (peer.events != nullptr && peer.events->flag_sync()) {
+        // gfx906 S9: one graph per device (see DecodeGraphSplitCapture).
+        definition.capture(state.execution.device.stream, body,
+                           DecodeGraphSplitCapture{peer.device->stream,
+                                                   state.execution.device.device,
+                                                   peer.device->device});
+        return;
+    }
     if (peer.graph_bridge == nullptr) {
         throw std::logic_error("tensor-parallel graph capture requires a peer capture bridge");
     }
-    peer.work->reset();
     definition.capture(state.execution.device.stream, body,
                        DecodeGraphPeerCapture{peer.graph_bridge, peer.device->stream});
 }

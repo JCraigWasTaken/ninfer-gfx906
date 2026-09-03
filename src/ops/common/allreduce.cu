@@ -25,11 +25,17 @@
 
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 
+#include <cuda_bf16.h>
+#include <hip/hip_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::ops {
 namespace {
@@ -137,6 +143,130 @@ bool enable_peer_access(const ExecutionContext& ec) {
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// gfx906 flag-sync transport (TP2 slice 9). See allreduce.h and tools/tp2/replay_probe.cu
+// (split-flag shape) for the design and the measurements behind the memory-type choices:
+// hipDeviceMallocFinegrained signal blocks DEADLOCK (the local poll is served from L2),
+// plain-cudaMalloc staging returns STALE partials (the reader's L2 keeps the previous call's
+// lines); hipDeviceMallocUncached for both is the combination that replays == eager.
+namespace {
+
+constexpr int kFlagBlocks  = 64;
+constexpr int kFlagThreads = 256;
+// Local polls between checks; ~64 M polls is tens of seconds, so a lost peer reports through the
+// status word instead of hanging the queue forever.
+constexpr unsigned long long kFlagTimeoutPolls = 1ull << 26;
+
+struct FlagSignal {
+    unsigned start[kFlagBlocks][2]; // written by the PEER, indexed by the writer's rank
+    unsigned end[kFlagBlocks][2];
+    unsigned seq[kFlagBlocks];      // this rank's own per-block sequence
+    unsigned status[2];             // [0] != 0: a wait timed out, [1] = the sequence it waited for
+};
+
+__device__ __forceinline__ bool flag_barrier(unsigned* peer_slot, const unsigned* self_slot,
+                                             unsigned flag, unsigned* status) {
+    __hip_atomic_store(peer_slot, flag, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    unsigned long long polls = 0;
+    while (__hip_atomic_load(self_slot, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < flag) {
+        __builtin_amdgcn_s_sleep(1);
+        if (++polls > kFlagTimeoutPolls) {
+            atomicOr(status, 1u);
+            status[1] = flag;
+            return false;
+        }
+    }
+    return true;
+}
+
+// Two-rank summing all-reduce, in place on `buffer`, BF16. Block b owns every element whose
+// 256-element chunk index is congruent to b modulo gridDim.x; the push and the combine of a block
+// cover the same elements, so the per-block barrier is sufficient.
+__global__ void flag_allreduce_bf16_kernel(__nv_bfloat16* buffer, __nv_bfloat16* peer_staging,
+                                           const __nv_bfloat16* staging, std::int64_t n,
+                                           FlagSignal* self_sg, FlagSignal* peer_sg, int rank) {
+    const int b                 = blockIdx.x;
+    const std::int64_t stride   = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t first    = static_cast<std::int64_t>(b) * blockDim.x + threadIdx.x;
+    __shared__ int ok;
+    for (std::int64_t i = first; i < n; i += stride) { peer_staging[i] = buffer[i]; }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned flag = self_sg->seq[b] + 1;
+        self_sg->seq[b]     = flag;
+        ok = flag_barrier(&peer_sg->start[b][rank], &self_sg->start[b][1 - rank], flag,
+                          self_sg->status);
+    }
+    __syncthreads();
+    if (!ok) { return; }
+    for (std::int64_t i = first; i < n; i += stride) {
+        // The qualified residual_add body: FP32 accumulate, one round-to-nearest-even on store.
+        buffer[i] = __float2bfloat16_rn(__bfloat162float(buffer[i]) + __bfloat162float(staging[i]));
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ok = flag_barrier(&peer_sg->end[b][rank], &self_sg->end[b][1 - rank], self_sg->seq[b],
+                          self_sg->status);
+    }
+    __syncthreads();
+}
+
+// Two-rank row gather over bytes: push my block into the peer's staging, barrier, then write my
+// own block and the peer's (now local) block into my destination, barrier.
+template <typename Word>
+__global__ void flag_allgather_kernel(Word* destination, const Word* own, std::int64_t own_words,
+                                      std::int64_t own_offset, Word* peer_staging,
+                                      const Word* staging, std::int64_t peer_words,
+                                      std::int64_t peer_offset, FlagSignal* self_sg,
+                                      FlagSignal* peer_sg, int rank) {
+    const int b               = blockIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t first  = static_cast<std::int64_t>(b) * blockDim.x + threadIdx.x;
+    __shared__ int ok;
+    for (std::int64_t i = first; i < own_words; i += stride) { peer_staging[i] = own[i]; }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned flag = self_sg->seq[b] + 1;
+        self_sg->seq[b]     = flag;
+        ok = flag_barrier(&peer_sg->start[b][rank], &self_sg->start[b][1 - rank], flag,
+                          self_sg->status);
+    }
+    __syncthreads();
+    if (!ok) { return; }
+    for (std::int64_t i = first; i < own_words; i += stride) { destination[own_offset + i] = own[i]; }
+    for (std::int64_t i = first; i < peer_words; i += stride) {
+        destination[peer_offset + i] = staging[i];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ok = flag_barrier(&peer_sg->end[b][rank], &self_sg->end[b][1 - rank], self_sg->seq[b],
+                          self_sg->status);
+    }
+    __syncthreads();
+}
+
+bool flag_sync_requested() {
+    const char* text = std::getenv("NINFER_GFX906_TP2_FLAG_SYNC");
+    return text != nullptr && text[0] == '1' && text[1] == '\0';
+}
+
+// Per-rank uncached staging capacity. The decode-time collectives are the row-parallel
+// projections' outputs ([hidden, B] BF16, 10 KB per row) and the logits gather ([V/2, B] BF16,
+// ~150 KB per row); 16 MB covers batches into the hundreds. Larger calls (prefill) take the event
+// transport, which is fine because prefill runs eagerly.
+constexpr std::size_t kFlagStagingBytes = std::size_t{16} << 20;
+
+int grid_for(std::int64_t work) {
+    const std::int64_t blocks = (work + kFlagThreads - 1) / kFlagThreads;
+    return static_cast<int>(blocks < 1 ? 1 : blocks > kFlagBlocks ? kFlagBlocks : blocks);
+}
+
+} // namespace
+
 PeerEvents::PeerEvents(const ExecutionContext& ec) {
     require_two_devices(ec, "PeerEvents: requires an ExecutionContext with two distinct devices");
     const CurrentDeviceGuard guard;
@@ -158,9 +288,58 @@ PeerEvents::PeerEvents(const ExecutionContext& ec) {
     }
     inputs_ready_ = {created[0], created[1]};
     pull_done_    = {created[2], created[3]};
+
+    if (!flag_sync_requested()) { return; }
+    // Allocated AFTER enable_peer_access() (the caller's order) so the runtime maps both blocks
+    // into the peer's address space; peer writes into them are the whole transport.
+    for (int rank = 0; rank < 2; ++rank) {
+        const int device = ec.dev[rank]->device;
+        CurrentDeviceGuard::set(device);
+        void* signal  = nullptr;
+        void* staging = nullptr;
+        cudaError_t status =
+            hipExtMallocWithFlags(&signal, sizeof(FlagSignal), hipDeviceMallocUncached);
+        if (status == cudaSuccess) {
+            status = hipExtMallocWithFlags(&staging, kFlagStagingBytes, hipDeviceMallocUncached);
+        }
+        if (status == cudaSuccess) { status = cudaMemset(signal, 0, sizeof(FlagSignal)); }
+        if (status == cudaSuccess) { status = cudaDeviceSynchronize(); }
+        if (status != cudaSuccess) {
+            if (signal != nullptr) { (void)cudaFree(signal); }
+            if (staging != nullptr) { (void)cudaFree(staging); }
+            for (int done = 0; done < rank; ++done) {
+                CurrentDeviceGuard::set(flag_device_[static_cast<std::size_t>(done)]);
+                (void)cudaFree(flag_signal_[static_cast<std::size_t>(done)]);
+                (void)cudaFree(flag_staging_[static_cast<std::size_t>(done)]);
+                flag_signal_[static_cast<std::size_t>(done)]  = nullptr;
+                flag_staging_[static_cast<std::size_t>(done)] = nullptr;
+            }
+            throw std::runtime_error(std::string("PeerEvents: flag-sync allocation failed: ") +
+                                     cudaGetErrorName(status) + ": " + cudaGetErrorString(status));
+        }
+        flag_signal_[static_cast<std::size_t>(rank)]  = signal;
+        flag_staging_[static_cast<std::size_t>(rank)] = staging;
+        flag_device_[static_cast<std::size_t>(rank)]  = device;
+    }
+    flag_capacity_ = kFlagStagingBytes;
+    std::fprintf(stderr, "[tp2] flag-sync transport ON (NINFER_GFX906_TP2_FLAG_SYNC=1): uncached "
+                         "signal blocks + %zu MB staging per rank\n", kFlagStagingBytes >> 20);
 }
 
 PeerEvents::~PeerEvents() {
+    if (flag_sync()) {
+        int previous = 0;
+        const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto slot = static_cast<std::size_t>(rank);
+            (void)cudaSetDevice(flag_device_[slot]);
+            (void)cudaFree(flag_signal_[slot]);
+            (void)cudaFree(flag_staging_[slot]);
+            flag_signal_[slot]  = nullptr;
+            flag_staging_[slot] = nullptr;
+        }
+        if (restore) { (void)cudaSetDevice(previous); }
+    }
     for (std::array<cudaEvent_t, 2>* group : {&inputs_ready_, &pull_done_}) {
         for (cudaEvent_t& event : *group) {
             if (event == nullptr) { continue; }
@@ -175,9 +354,14 @@ PeerEvents::~PeerEvents() {
 }
 
 PeerEvents::PeerEvents(PeerEvents&& other) noexcept
-    : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_) {
+    : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_),
+      flag_signal_(other.flag_signal_), flag_staging_(other.flag_staging_),
+      flag_device_(other.flag_device_), flag_capacity_(other.flag_capacity_) {
     other.inputs_ready_ = {nullptr, nullptr};
     other.pull_done_    = {nullptr, nullptr};
+    other.flag_signal_  = {nullptr, nullptr};
+    other.flag_staging_ = {nullptr, nullptr};
+    other.flag_capacity_ = 0;
 }
 
 PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
@@ -185,8 +369,13 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
     // held, in exactly one place.
     inputs_ready_.swap(other.inputs_ready_);
     pull_done_.swap(other.pull_done_);
+    flag_signal_.swap(other.flag_signal_);
+    flag_staging_.swap(other.flag_staging_);
+    flag_device_.swap(other.flag_device_);
+    std::swap(flag_capacity_, other.flag_capacity_);
     return *this;
 }
+
 
 void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
                    const ExecutionContext& ec, const PeerEvents& events) {
@@ -221,6 +410,26 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
 #endif
 
     const CurrentDeviceGuard guard;
+
+    if (events.flag_sync() && bytes <= events.flag_capacity()) {
+        // Both launches are issued by this thread with no synchronisation in between (the
+        // deadlock rule: a rank's kernel waits for the peer's, which must already be enqueued or
+        // guaranteed to be by the same thread).
+        const std::int64_t n = buffer[0].numel();
+        const int grid       = grid_for(n);
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            flag_allreduce_bf16_kernel<<<grid, kFlagThreads, 0, local.stream>>>(
+                static_cast<__nv_bfloat16*>(buffer[rank].data),
+                static_cast<__nv_bfloat16*>(events.flag_staging(1 - rank)),
+                static_cast<const __nv_bfloat16*>(events.flag_staging(rank)), n,
+                static_cast<FlagSignal*>(events.flag_signal(rank)),
+                static_cast<FlagSignal*>(events.flag_signal(1 - rank)), rank);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
 
     // Phase A: publish "my operand is complete" on each stream, before any wait observes it.
     for (int rank = 0; rank < 2; ++rank) {
@@ -293,6 +502,48 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
 #endif
 
     const CurrentDeviceGuard guard;
+
+    if (events.flag_sync() && block[0] <= events.flag_capacity() &&
+        block[1] <= events.flag_capacity()) {
+        const auto d0 = reinterpret_cast<std::uintptr_t>(destination[0].data);
+        const auto d1 = reinterpret_cast<std::uintptr_t>(destination[1].data);
+        const auto p0 = reinterpret_cast<std::uintptr_t>(part[0].data);
+        const auto p1 = reinterpret_cast<std::uintptr_t>(part[1].data);
+        const bool words4 = ((d0 | d1 | p0 | p1 | block[0] | block[1]) & 3) == 0;
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            auto* self_sg = static_cast<FlagSignal*>(events.flag_signal(rank));
+            auto* peer_sg = static_cast<FlagSignal*>(events.flag_signal(1 - rank));
+            if (words4) {
+                const auto own_words  = static_cast<std::int64_t>(block[rank] / 4);
+                const auto peer_words = static_cast<std::int64_t>(block[1 - rank] / 4);
+                flag_allgather_kernel<std::uint32_t>
+                    <<<grid_for(own_words > peer_words ? own_words : peer_words), kFlagThreads, 0,
+                       local.stream>>>(static_cast<std::uint32_t*>(destination[rank].data),
+                                       static_cast<const std::uint32_t*>(part[rank].data),
+                                       own_words, static_cast<std::int64_t>(offset[rank] / 4),
+                                       static_cast<std::uint32_t*>(events.flag_staging(1 - rank)),
+                                       static_cast<const std::uint32_t*>(events.flag_staging(rank)),
+                                       peer_words, static_cast<std::int64_t>(offset[1 - rank] / 4),
+                                       self_sg, peer_sg, rank);
+            } else {
+                const auto own_words  = static_cast<std::int64_t>(block[rank]);
+                const auto peer_words = static_cast<std::int64_t>(block[1 - rank]);
+                flag_allgather_kernel<std::uint8_t>
+                    <<<grid_for(own_words > peer_words ? own_words : peer_words), kFlagThreads, 0,
+                       local.stream>>>(static_cast<std::uint8_t*>(destination[rank].data),
+                                       static_cast<const std::uint8_t*>(part[rank].data),
+                                       own_words, static_cast<std::int64_t>(offset[rank]),
+                                       static_cast<std::uint8_t*>(events.flag_staging(1 - rank)),
+                                       static_cast<const std::uint8_t*>(events.flag_staging(rank)),
+                                       peer_words, static_cast<std::int64_t>(offset[1 - rank]),
+                                       self_sg, peer_sg, rank);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
 
     // Phase A: publish "my block is complete".
     for (int rank = 0; rank < 2; ++rank) {

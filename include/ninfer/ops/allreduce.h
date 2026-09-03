@@ -130,9 +130,36 @@ public:
                pull_done_[0] != nullptr && pull_done_[1] != nullptr;
     }
 
+    // gfx906 FLAG-SYNC TRANSPORT (TP2 slice 9), on when NINFER_GFX906_TP2_FLAG_SYNC=1 at
+    // construction. ROCm's graph executor runs every node of a graph on the launch device, so a
+    // tensor-parallel decode graph has to be two per-device graphs, and two live captures cannot
+    // be bridged by events. With the transport on, both collectives above are ONE kernel per rank
+    // that synchronises through device memory instead of events (the mxxm llama.cpp fork's
+    // tp-allreduce idiom): each rank PCIe-writes its operand into the peer's staging (uncached
+    // memory: incoming writes land in HBM, and the reader's loads never hit a stale L2 line), then
+    // thread 0 of every block stores a per-block sequence number into the PEER's signal block and
+    // polls its OWN (hipDeviceMallocUncached) signal block with ACQUIRE/SYSTEM loads; the flag
+    // rides the same PCIe link as the data so it lands after it. A second barrier after the
+    // combine keeps the peer from overwriting staging that is still being read. Sequence numbers
+    // live in the signal blocks, so a captured call replays correctly with identical arguments.
+    // Calls larger than flag_capacity() bytes (prefill) use the event transport; every decode-time
+    // collective fits.
+    [[nodiscard]] bool flag_sync() const noexcept { return flag_signal_[0] != nullptr; }
+    [[nodiscard]] void* flag_signal(int rank) const noexcept {
+        return flag_signal_[static_cast<std::size_t>(rank)];
+    }
+    [[nodiscard]] void* flag_staging(int rank) const noexcept {
+        return flag_staging_[static_cast<std::size_t>(rank)];
+    }
+    [[nodiscard]] std::size_t flag_capacity() const noexcept { return flag_capacity_; }
+
 private:
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
+    std::array<void*, 2> flag_signal_{nullptr, nullptr};
+    std::array<void*, 2> flag_staging_{nullptr, nullptr};
+    std::array<int, 2> flag_device_{0, 0};
+    std::size_t flag_capacity_ = 0;
 };
 
 /**

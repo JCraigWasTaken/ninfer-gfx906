@@ -65,6 +65,18 @@ struct DecodeGraphPeerCapture {
     cudaStream_t stream                 = nullptr;
 };
 
+// gfx906 (TP2 slice 9): a SPLIT capture. ROCm's graph executor runs every node of a graph on the
+// device the graph is launched on, so the bridged single graph above replays rank 1's kernels on
+// rank 0 over PCIe (S8 diagnosis). Instead both streams capture at once, each into its OWN graph,
+// with no cross-capture edge: the collectives synchronise through device memory
+// (ops::PeerEvents::flag_sync). The executable then holds two graphs and launches each on its
+// own device's stream, back to back, from one host thread.
+struct DecodeGraphSplitCapture {
+    cudaStream_t peer_stream = nullptr;
+    int origin_device        = 0;
+    int peer_device          = 0;
+};
+
 class DecodeGraphDefinition {
 public:
     DecodeGraphDefinition() = default;
@@ -82,7 +94,12 @@ public:
     // capture ends. A null `peer.bridge` is the single-device form above.
     void capture(cudaStream_t stream, const std::function<void()>& body,
                  const DecodeGraphPeerCapture& peer);
+    // Split capture (see DecodeGraphSplitCapture): `stream` and `split.peer_stream` both capture,
+    // each into its own graph.
+    void capture(cudaStream_t stream, const std::function<void()>& body,
+                 const DecodeGraphSplitCapture& split);
     [[nodiscard]] bool ready() const noexcept;
+    [[nodiscard]] bool split() const noexcept { return peer_graph_ != nullptr; }
     // Node count of the captured graph, 0 when empty. Cross-device event edges are edges, not
     // nodes, so this counts real device work on BOTH devices.
     [[nodiscard]] std::size_t node_count() const;
@@ -90,7 +107,11 @@ public:
 
 private:
     friend class DecodeGraphExecutable;
-    cudaGraph_t graph_ = nullptr;
+    cudaGraph_t graph_        = nullptr;
+    cudaGraph_t peer_graph_   = nullptr;
+    cudaStream_t peer_stream_ = nullptr;
+    int origin_device_        = 0;
+    int peer_device_          = 0;
 };
 
 class DecodeGraphExecutable {
@@ -106,12 +127,19 @@ public:
     void instantiate(const DecodeGraphDefinition& definition);
     void update(const DecodeGraphDefinition& definition);
     void upload(cudaStream_t stream);
+    // For a split executable this launches the origin graph on `stream` and the peer graph on the
+    // peer stream it was captured from, in that order, without any host synchronisation between
+    // the two (the flag-sync deadlock rule).
     void launch(cudaStream_t stream);
     [[nodiscard]] bool ready() const noexcept;
     void reset() noexcept;
 
 private:
-    cudaGraphExec_t exec_ = nullptr;
+    cudaGraphExec_t exec_      = nullptr;
+    cudaGraphExec_t peer_exec_ = nullptr;
+    cudaStream_t peer_stream_  = nullptr;
+    int origin_device_         = 0;
+    int peer_device_           = 0;
 };
 
 } // namespace ninfer
