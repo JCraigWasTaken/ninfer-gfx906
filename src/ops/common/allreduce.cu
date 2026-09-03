@@ -249,9 +249,14 @@ __global__ void flag_allgather_kernel(Word* destination, const Word* own, std::i
     __syncthreads();
 }
 
+// TP2 slice 9b: the flag-sync transport is the tp2 DEFAULT (graphs-on tp2 passed the parity
+// gate and the graph/MTP test family with it, and it is the only transport that replays a
+// tensor-parallel decode graph at speed on ROCm 6.4.1). NINFER_GFX906_TP2_FLAG_SYNC=0 restores
+// the S8 event-bridged single graph (correct, ~0.2 tok/s) for A/B work; --no-cuda-graph stays
+// the eager path either way.
 bool flag_sync_requested() {
     const char* text = std::getenv("NINFER_GFX906_TP2_FLAG_SYNC");
-    return text != nullptr && text[0] == '1' && text[1] == '\0';
+    return text == nullptr || !(text[0] == '0' && text[1] == '\0');
 }
 
 // Per-rank uncached staging capacity. The decode-time collectives are the row-parallel
@@ -332,8 +337,9 @@ PeerEvents::PeerEvents(const ExecutionContext& ec) {
         flag_device_[static_cast<std::size_t>(rank)]  = device;
     }
     flag_capacity_ = kFlagStagingBytes;
-    std::fprintf(stderr, "[tp2] flag-sync transport ON (NINFER_GFX906_TP2_FLAG_SYNC=1): uncached "
-                         "signal blocks + %zu MB staging per rank\n", kFlagStagingBytes >> 20);
+    std::fprintf(stderr, "[tp2] flag-sync transport ON (tp2 default; NINFER_GFX906_TP2_FLAG_SYNC=0 "
+                         "disables): uncached signal blocks + %zu MB staging per rank\n",
+                 kFlagStagingBytes >> 20);
 }
 
 PeerEvents::~PeerEvents() {

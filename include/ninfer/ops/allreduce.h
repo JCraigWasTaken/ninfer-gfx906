@@ -130,8 +130,8 @@ public:
                pull_done_[0] != nullptr && pull_done_[1] != nullptr;
     }
 
-    // gfx906 FLAG-SYNC TRANSPORT (TP2 slice 9), on when NINFER_GFX906_TP2_FLAG_SYNC=1 at
-    // construction. ROCm's graph executor runs every node of a graph on the launch device, so a
+    // gfx906 FLAG-SYNC TRANSPORT (TP2 slice 9), the tp2 default since slice 9b; off when
+    // NINFER_GFX906_TP2_FLAG_SYNC=0 at construction. ROCm's graph executor runs every node of a graph on the launch device, so a
     // tensor-parallel decode graph has to be two per-device graphs, and two live captures cannot
     // be bridged by events. With the transport on, both collectives above are ONE kernel per rank
     // that synchronises through device memory instead of events (the mxxm llama.cpp fork's

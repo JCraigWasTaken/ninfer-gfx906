@@ -240,4 +240,28 @@ S9 (flag-synced split graphs, 2026-09-02) - tp2 graphs-on works: md5 = tp1 = eag
    both cards read 100 % busy at ~145 W with graphs on exactly as eager; decode is bandwidth-bound continuously and a
    spinning wave counts as busy. Remaining: promote the knob + graphs as the tp2 default (parity test, MTP family),
    h2h vs production, surface FlagSignal::status through the graph-trace knob, size the 16 MB staging from the plan.
-   Commits 7317d9c2 (probe), 99bd9f9d (runtime), HEAD (capture-only + docs) (capture-only + docs); RESULT TP2-S9 in ~/EXPERIMENTS.md.
+   Commits 7317d9c2 (probe), 99bd9f9d (runtime), 7c02856c (capture-only + docs); RESULT TP2-S9 in ~/EXPERIMENTS.md.
+
+S9b (graphs-on gates + flag-sync default, 2026-09-02) - the flag-sync transport is now the tp2 DEFAULT.
+   Gates with NINFER_GFX906_TP2_FLAG_SYNC=1 (all two-card, stage10/tp2-s9b-*.log): parity test with phase F ON
+   (128 positions x 5 prompts, 1511 s): gate PASS, KL 0.000451 vs budget 0.00181, argmax 7/7, (1-cos) 7.87e-5 vs
+   8.53e-5 (byte-for-byte the S6 eager numbers: phases C/D are eager), corpus argmax 636/640, and phase F "tp2
+   graphs-on vs tp2 eager" EXACT on every prompt (193/411/160/512/512 tokens). ninfer_qwen3_8_27b_graph_tp2_test OK
+   (48 s: graphs == eager over 128 steps, reproducible across two graph runs). MTP at tp2 graphs-on, apps/ninfer:
+   p5 code d3 200-new 46.11 tok/s @ 94.31 % (md5 c56fa74a60c73835 = eager = S6; eager tp2 37.3, tp1 36.7), p4
+   prose d2 128-new 25.38 tok/s @ 55 % (md5 1a2308484a9c3797 = the plain 128-new text; eager 25.2, tp1 22.2);
+   ninfer_bench --mtp-draft-tokens 3 -p 512 -n 128 -r 3: decode_output_tok_s 22.46 +- 0.04 @ acceptance 29.2 %
+   (decode_path mtp_cuda_graph; tp1 pass 2e 18.00 @ 30.2 %), pp512 338.2.
+   Two donor tests FAIL for reasons the graph does not own: ninfer_qwen3_8_27b_tp2_real_test "tp1 and tp2 greedy
+   output diverge after 12 of 32 tokens" with graphs ON and IDENTICALLY with NINFER_TP2_TEST_GRAPHS=0 (eager, 60 s
+   each) - a synthetic-prompt + Int8Group64-KV split divergence, the same verdict the S6 note anticipated;
+   ninfer_qwen3_8_27b_mtp_tp2_real_test probe A passes in full (oracle 64/64 both widths, acceptance 0.90 = tp1)
+   but probe B fails leg 1 ("tp2 MTP3 tracks tp1 MTP3 for 3 of 64 tokens, worse than the ordinary path's 18"): the
+   ordinary split itself leaves tp1 at token 18 on that prompt, so the comparison is between two diverged texts (the
+   donor's own comment on probe B records the same knife edge at token 12). The test now honours
+   NINFER_TP2_TEST_GRAPHS=0 like its sibling so the eager leg can be run; see RESULT TP2-S9b for that run.
+   Default flip: allreduce.cu flag_sync_requested() is true unless NINFER_GFX906_TP2_FLAG_SYNC=0 (which restores
+   the S8 event-bridged single graph; --no-cuda-graph is still eager). Post-flip gates with NO env: tp2 p3 md5
+   52960e3a58e9ef2002021c8cd3904855 (33.98 tok/s, transport banner "tp2 default"), tp1 p3 on card 2 md5 unchanged
+   (23.13 tok/s), tp1 p4 MTP d3 on card 2 md5 32ba0f7a69b8da571d60ce25f6dbb3aa unchanged (20.26 tok/s, 37.85 %).
+   RESULT TP2-S9b in ~/EXPERIMENTS.md.
