@@ -259,7 +259,8 @@ S9b (graphs-on gates + flag-sync default, 2026-09-02) - the flag-sync transport 
    but probe B fails leg 1 ("tp2 MTP3 tracks tp1 MTP3 for 3 of 64 tokens, worse than the ordinary path's 18"): the
    ordinary split itself leaves tp1 at token 18 on that prompt, so the comparison is between two diverged texts (the
    donor's own comment on probe B records the same knife edge at token 12). The test now honours
-   NINFER_TP2_TEST_GRAPHS=0 like its sibling so the eager leg can be run; see RESULT TP2-S9b for that run.
+   NINFER_TP2_TEST_GRAPHS=0 like its sibling; the eager leg (441 s) reproduces the graphs-on result byte for byte, so
+   neither donor-test failure belongs to the graph path.
    Default flip: allreduce.cu flag_sync_requested() is true unless NINFER_GFX906_TP2_FLAG_SYNC=0 (which restores
    the S8 event-bridged single graph; --no-cuda-graph is still eager). Post-flip gates with NO env: tp2 p3 md5
    52960e3a58e9ef2002021c8cd3904855 (33.98 tok/s, transport banner "tp2 default"), tp1 p3 on card 2 md5 unchanged
