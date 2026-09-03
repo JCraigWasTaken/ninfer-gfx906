@@ -60,6 +60,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -104,6 +105,13 @@ ninfer::EngineOptions engine_options(const char* artifact, int tp, bool mtp, boo
     options.prefill_chunk  = kPrefillChunk;
     options.kv_cache       = ninfer::KvCacheStorage::Int8Group64;
     options.tp             = tp;
+    // gfx906 port (TP2 slice 9b): NINFER_TP2_TEST_GRAPHS=0 runs every leg eagerly, as in
+    // test_engine_tp2_real.cpp, to separate a capture question from a split question (LEG 3
+    // then compares two eager engines and passes trivially).
+    if (const char* env = std::getenv("NINFER_TP2_TEST_GRAPHS");
+        env != nullptr && std::string_view(env) == "0") {
+        graphs = false;
+    }
     options.use_cuda_graph = graphs;
     if (tp == 2) {
         options.devices = {0, 1};
