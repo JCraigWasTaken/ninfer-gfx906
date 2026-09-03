@@ -266,3 +266,27 @@ S9b (graphs-on gates + flag-sync default, 2026-09-02) - the flag-sync transport 
    52960e3a58e9ef2002021c8cd3904855 (33.98 tok/s, transport banner "tp2 default"), tp1 p3 on card 2 md5 unchanged
    (23.13 tok/s), tp1 p4 MTP d3 on card 2 md5 32ba0f7a69b8da571d60ce25f6dbb3aa unchanged (20.26 tok/s, 37.85 %).
    RESULT TP2-S9b in ~/EXPERIMENTS.md.
+
+### S9c (2026-09-02 21:58): flag-sync default REVERTED after a card-2 wedge under ninfer-serve
+
+Head-to-head v2 (`~/ninfer-work/stage10/h2h-v2/`, mirrored to the kit): ninfer-serve `--tp 2 --devices 0,1`,
+graphs on via the S9b default, MTP d3, bf16 KV, chat endpoint with thinking on, temp 0.8 / top-p 0.95 / top-k 20,
+1024 new tokens per request. Eleven requests completed (essay 29.7-34.6 t/s at 46-58% acceptance, code
+29.7-31.6 t/s at 46-51%), then request 12 (code prompt, 107 tokens, `reuse=full_reset`) hung 7 s after
+submission: HSA "HW Exception by GPU node-2 ... GPU Hang"; kernel `ring page0 timeout` on 0000:09:00.0,
+`GPU reset begin`, MODE1 reset FAILED (-22), SMU messages failing, sysfs unreadable; the wedge watcher
+confirmed at strike 3/3 (21:48:57) and SysRq-rebooted the box (up 21:49:29, RAS 0/0/0, production healthy).
+Crash log: `h2h-v2/ninfer-serve-CRASH.log`; kernel journal: kit `h2h-v2/journal-prev-boot-2140-to-reboot.log`.
+
+Reading: a spin-wait inside a per-device graph that never sees its flag is exactly the shape that wedges an
+MI50 (the ring cannot preempt a spinning wave; the reset fails). The S9b CLI gates (parity, 128-step graph
+replay, MTP md5s) never exercised the serve path's sampling + `full_reset` re-arm sequence. Until that path is
+root-caused (candidates: graph re-instantiation on full_reset with a stale flag epoch; the 16 MB staging
+overrun on a wider verify batch; the MTP verify-width switch under sampling), flag-sync is OPT-IN again
+(`NINFER_GFX906_TP2_FLAG_SYNC=1`) and tp2 defaults to the eager path. Do not run tp2 graphs-on under
+ninfer-serve without a wedge-watcher-armed box and production stopped.
+
+Numbers that stand from h2h-v2 (same requests, back to back, same box): production essay 46.6 wall / 49.3
+server t/s, production code 58.7 / 59.8; ninfer tp2 graphs-on essay 30.9, code 30.4 (3 of 8 requests). The
+CLI's 46.1 t/s "MTP code" figure was greedy with thinking off; the served number with sampling and thinking on
+is 30, at roughly half the acceptance.
