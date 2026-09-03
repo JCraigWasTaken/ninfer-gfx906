@@ -142,8 +142,8 @@ public:
     // rides the same PCIe link as the data so it lands after it. A second barrier after the
     // combine keeps the peer from overwriting staging that is still being read. Sequence numbers
     // live in the signal blocks, so a captured call replays correctly with identical arguments.
-    // Calls larger than flag_capacity() bytes (prefill) use the event transport; every decode-time
-    // collective fits.
+    // Only CAPTURED calls that fit in flag_capacity() bytes use it; prefill and eager decode keep
+    // the event transport (see allreduce.cu: capturing()).
     [[nodiscard]] bool flag_sync() const noexcept { return flag_signal_[0] != nullptr; }
     [[nodiscard]] void* flag_signal(int rank) const noexcept {
         return flag_signal_[static_cast<std::size_t>(rank)];

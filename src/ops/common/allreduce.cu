@@ -260,6 +260,16 @@ bool flag_sync_requested() {
 // transport, which is fine because prefill runs eagerly.
 constexpr std::size_t kFlagStagingBytes = std::size_t{16} << 20;
 
+// The flag transport is for CAPTURED collectives, where the event transport cannot be used at all
+// (two live captures cannot be bridged). Outside a capture the event transport stays: prefill's
+// multi-MB all-reduces are faster as SDMA copies than as a 64-block push kernel (pp512 339 vs 253
+// tok/s), and eager decode keeps its byte-identical S7 path.
+bool capturing(const ExecutionContext& ec) {
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    CUDA_CHECK(hipStreamIsCapturing(ec.dev[0]->stream, &status));
+    return status != hipStreamCaptureStatusNone;
+}
+
 int grid_for(std::int64_t work) {
     const std::int64_t blocks = (work + kFlagThreads - 1) / kFlagThreads;
     return static_cast<int>(blocks < 1 ? 1 : blocks > kFlagBlocks ? kFlagBlocks : blocks);
@@ -411,7 +421,7 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
 
     const CurrentDeviceGuard guard;
 
-    if (events.flag_sync() && bytes <= events.flag_capacity()) {
+    if (events.flag_sync() && bytes <= events.flag_capacity() && capturing(ec)) {
         // Both launches are issued by this thread with no synchronisation in between (the
         // deadlock rule: a rank's kernel waits for the peer's, which must already be enqueued or
         // guaranteed to be by the same thread).
@@ -504,7 +514,7 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
     const CurrentDeviceGuard guard;
 
     if (events.flag_sync() && block[0] <= events.flag_capacity() &&
-        block[1] <= events.flag_capacity()) {
+        block[1] <= events.flag_capacity() && capturing(ec)) {
         const auto d0 = reinterpret_cast<std::uintptr_t>(destination[0].data);
         const auto d1 = reinterpret_cast<std::uintptr_t>(destination[1].data);
         const auto p0 = reinterpret_cast<std::uintptr_t>(part[0].data);

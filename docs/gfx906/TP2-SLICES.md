@@ -219,3 +219,25 @@ S8 (diagnosis, 2026-09-02) - why the dual-device graph replays at 0.21 t/s. tool
    memory (signal kernel P2P-writes a sequence into the peer's flag, spin-wait kernel, peer-read copy kernel, combine),
    knob NINFER_GFX906_TP2_FLAG_SYNC. Until then tp2 runs eager (--no-cuda-graph, 31.93 t/s); treat tp2 graphs-on as
    broken on ROCm 6.4.1. Full note: ~/ninfer-work/stage10/tp2-s8-diagnosis.md; RESULT TP2-S8 in ~/EXPERIMENTS.md.
+
+S9 (flag-synced split graphs, 2026-09-02) - tp2 graphs-on works: md5 = tp1 = eager, tg128 35.53 t/s vs eager 31.75.
+   Design (S8 write-up + the mxxm llama.cpp fork's tp-allreduce.cu idiom, b10811): both device streams capture at once,
+   each into its OWN hipGraph (DecodeGraphSplitCapture; no cross-capture edge), launched back to back on their own
+   streams by one thread (DecodeGraphExecutable::launch). The collectives (ops::allreduce_sum, allgather_rows) become
+   one kernel per rank behind NINFER_GFX906_TP2_FLAG_SYNC=1: each block PCIe-writes its slice into the PEER's
+   hipDeviceMallocUncached staging, thread 0 stores a per-block sequence (RELEASE/SYSTEM) into the PEER's uncached
+   signal block and polls its OWN (ACQUIRE/SYSTEM + s_sleep) - the spin never crosses PCIe - then the combine reads
+   local staging and a second barrier protects it from the next call. Only CAPTURED calls use it; prefill and eager
+   decode keep the event transport (prefill's 5 MB all-reduces are faster as SDMA copies: pp512 339 vs 253 tok/s).
+   Memory types are the whole story on gfx906 (tools/tp2/replay_probe.cu split-flag shape, CLI [signal] [staging]):
+   uncached+uncached replays == eager through 20 000 replays; fine-grained signal blocks DEADLOCK (local poll served
+   from L2); plain-cudaMalloc staging returns stale partials (DIFFER at 5 rounds); the first design (poll the peer's
+   flag via UVA, peer-READ data) deadlocks or reads stale data because remote VRAM is mapped cacheable and gfx906 has
+   no L2 writeback instruction. Probe cost 16 us/round (4 nodes) vs eager 38 and dual-memcpy 62 (which ran on one
+   device); long run 100 x 20 000 replays: both cards 96-99 % busy, 57-58 W, == eager. Runtime gates: tp2 graphs-on
+   p3 md5 52960e3a58e9ef2002021c8cd3904855 (35.5 tok/s in apps/ninfer; S8: 0.21), ninfer_bench tg128 graphs-on
+   35.53 vs eager 31.75 (+12.7 %), tp1 p3 md5 unchanged. NOT delivered: the "cooler cards" prediction -
+   both cards read 100 % busy at ~145 W with graphs on exactly as eager; decode is bandwidth-bound continuously and a
+   spinning wave counts as busy. Remaining: promote the knob + graphs as the tp2 default (parity test, MTP family),
+   h2h vs production, surface FlagSignal::status through the graph-trace knob, size the 16 MB staging from the plan.
+   Commits 7317d9c2 (probe), 99bd9f9d (runtime), HEAD (capture-only + docs) (capture-only + docs); RESULT TP2-S9 in ~/EXPERIMENTS.md.
