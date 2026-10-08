@@ -290,3 +290,10 @@ Numbers that stand from h2h-v2 (same requests, back to back, same box): producti
 server t/s, production code 58.7 / 59.8; ninfer tp2 graphs-on essay 30.9, code 30.4 (3 of 8 requests). The
 CLI's 46.1 t/s "MTP code" figure was greedy with thinking off; the served number with sampling and thinking on
 is 30, at roughly half the acceptance.
+
+### S9c correction (2026-09-04)
+
+The crash bundle for this hang records an uncorrectable HBM error (umc UE) on card 2 (0000:09:00.0) at 21:47.
+Card 1 logged six such errors in six days, three of them under ordinary production at 58-63 C, so the hang more
+likely came from the card than from the spin-wait reading above. Nobody ran tp2 graphs-on under ninfer-serve
+again, so flag-sync stays opt-in.

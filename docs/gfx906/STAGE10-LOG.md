@@ -188,3 +188,15 @@ got 2-3x faster, so the draft path (W8 MTP-layer shards + the split draft head) 
 (c) RCCL 2.30 as shipped cannot complete a 2-card collective on this host at all (its own rccl-tests fail at the
 first AllReduce, iommu=pt ruled out) — reported on mx-llama.cpp issue #7 — so an RCCL-backed exchange is blocked;
 (d) the exchange is bounded at <= 5.9 ms/token and is not yet the limiter.
+
+Slice 9 later fixed (a): one graph per card with an in-graph flag barrier replays at 35.5 t/s plain (TP2-SLICES.md
+S9-S9c).
+
+## 8. Closed (2026-09-04)
+
+A served side-by-side run against mx-llama.cpp on the same box gave 0.52-0.66x (TP2-S9B-RESULT.md, TP2-SLICES.md
+S9c). The rocprofv3 profile (PROFILE-REPORT.md) then showed the GPU busy 99.7% of each token: the gap is matrix
+kernels below the bandwidth limit, not launch overhead. mx-llama.cpp's kernels already run at 90% or more of that
+limit, so tuning this port could at best draw level, and at 8 bits it would read twice the bytes. A follow-up
+check on 2026-09-04 found mx-llama.cpp's small-batch verify far cheaper per extra token: 6.7 ms on one card, against
+this port's 18.6 ms. Work stopped here; README.md has the final numbers and the open problems.
